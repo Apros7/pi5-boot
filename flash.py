@@ -74,7 +74,7 @@ APP_DIR = "/opt/easysort-motion"
 BOOT_DIR = "easysort"  # on the boot partition, /boot/firmware/easysort on the Pi
 WIFI_COUNTRY = "DK"
 APP_FILES = ("motion_capture.py", "windows.py", "upload.py", "enroll.py", "firstboot.sh", "easysort-motion.service",
-             "easysort-firstboot.service", "README.md")
+             "easysort-firstboot.service", "preview.py", "easysort-preview.service", "README.md")
 
 MIN_CARD_BYTES = 8 * 1000**3
 MAX_CARD_BYTES = 256 * 1000**3
@@ -311,9 +311,10 @@ users:
   - [install, -m, "0755", {APP_DIR}/firstboot.sh, /usr/local/sbin/easysort-firstboot]
   - [install, -m, "0644", {APP_DIR}/easysort-firstboot.service, /etc/systemd/system/]
   - [install, -m, "0644", {APP_DIR}/easysort-motion.service, /etc/systemd/system/]
+  - [install, -m, "0644", {APP_DIR}/easysort-preview.service, /etc/systemd/system/]
   - [systemctl, daemon-reload]
-  - [systemctl, enable, easysort-firstboot.service, easysort-motion.service]
-  - [systemctl, start, --no-block, easysort-firstboot.service, easysort-motion.service]
+  - [systemctl, enable, easysort-firstboot.service, easysort-motion.service, easysort-preview.service]
+  - [systemctl, start, --no-block, easysort-firstboot.service, easysort-motion.service, easysort-preview.service]
 """
 
 

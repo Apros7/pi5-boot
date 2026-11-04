@@ -1,0 +1,23 @@
+[Unit]
+Description=Easysort camera check page (127.0.0.1:8080, on the tailnet through tailscale serve)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+# Read-only and separate from easysort-motion: recording never depends on it.
+User=easysort
+Group=easysort
+SupplementaryGroups=video
+ExecStart=/usr/bin/python3 /opt/easysort-motion/preview.py --bind 127.0.0.1 --port 8080 --run-dir /run/easysort-motion --data /var/lib/easysort-motion
+Restart=always
+RestartSec=10
+Nice=10
+MemoryMax=64M
+CPUQuota=25%
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

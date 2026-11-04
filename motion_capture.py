@@ -11,6 +11,10 @@ motion to 2 s after it. Frames without motion are dropped.
 The kept frames of each UTC quarter hour become one mp4 plus a JSON sidecar
 (windows.py), and upload.py sends both to R2 through the device-storage
 Worker with the token the Pi got when it enrolled.
+
+For the camera check page (preview.py) it also keeps a few small JPEGs in
+/run/easysort-motion (RAM): each camera's newest frame every 5 s and the
+last 5 motion frames.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import argparse
 import glob
 import itertools
+import json
 import logging
 import os
 import signal
@@ -39,6 +44,8 @@ CAPTURE_INTERVAL_S = 0.25
 # put side by side, so the window mp4 stays a sane size.
 MAX_TILE_HEIGHT = 1080
 DEFAULT_DATA = "/var/lib/easysort-motion"
+SNAPSHOT_WIDTH = 960
+SNAPSHOT_QUALITY = 70
 
 
 @dataclass(frozen=True)
@@ -275,6 +282,123 @@ def encode_jpeg(frame: np.ndarray, quality: int = 90) -> bytes:
     return data.tobytes()
 
 
+# --- Snapshots for the camera check page ------------------------------------
+
+
+def camera_name(device: str) -> str:
+    """usb-046d_HD_Pro_Webcam_C920_AB12-video-index0 -> 046d_HD_Pro_Webcam_C920_AB12"""
+    name = Path(device).name
+    name = name.removeprefix("usb-").removesuffix("-video-index0")
+    return name or device
+
+
+class Snapshots:
+    """Small JPEGs of what the cameras see, for preview.py.
+
+    Each camera's newest frame every live_every_s, and the frames of the
+    cameras that saw motion, at most once every motion_every_s, keeping the
+    newest `keep`. Images are at most 960 px wide at JPEG quality 70 (about
+    100 KB). The folder is /run (RAM), so this costs no SD-card writes. Any
+    error is logged once and never stops recording.
+    """
+
+    INDEX = "snapshots.json"
+
+    def __init__(
+        self,
+        folder: Path,
+        cameras: list[str],
+        live_every_s: float = 5.0,
+        motion_every_s: float = 10.0,
+        keep: int = 5,
+    ) -> None:
+        self.folder = folder
+        self.cameras = cameras
+        self.live_every_s = live_every_s
+        self.motion_every_s = motion_every_s
+        self.keep = keep
+        self.live: dict[int, list[dict]] = {}
+        self.motion: list[dict] = []
+        self._next_live = float("-inf")
+        self._next_motion = float("-inf")
+        self._warned = False
+        try:
+            self._load()
+        except (OSError, ValueError) as error:
+            self._warn(error)
+
+    def update(self, ts: float, frames: list[np.ndarray | None], motion: list[bool]) -> None:
+        try:
+            self._update(ts, frames, motion)
+        except (OSError, cv2.error, RuntimeError) as error:
+            self._warn(error)
+
+    def _warn(self, error: Exception) -> None:
+        if not self._warned:
+            self._warned = True
+            log.warning("Camera check snapshots failed (recording is not affected): %s", error)
+
+    def _load(self) -> None:
+        """Keep the motion frames of an earlier run (the folder survives a restart); drop the rest."""
+        self.folder.mkdir(parents=True, exist_ok=True)
+        index = self.folder / self.INDEX
+        if index.exists():
+            self.motion = [
+                entry for entry in json.loads(index.read_text()).get("motion", [])[-self.keep:]
+                if (self.folder / entry["file"]).exists()
+            ]
+        kept = {entry["file"] for entry in self.motion}
+        for path in self.folder.glob("*.jpg"):
+            if path.name not in kept:
+                path.unlink()
+
+    def _update(self, ts: float, frames: list[np.ndarray | None], motion: list[bool]) -> None:
+        changed = False
+        if ts >= self._next_live:
+            self._next_live = ts + self.live_every_s
+            for number, frame in enumerate(frames):
+                if frame is None:
+                    continue
+                entries = self.live.setdefault(number, [])
+                entries.append(self._write("live", number, ts, frame))
+                # The one before stays a little longer, for a page that
+                # was made just before this write.
+                while len(entries) > 2:
+                    self._remove(entries.pop(0))
+                changed = True
+        if any(motion) and ts >= self._next_motion:
+            self._next_motion = ts + self.motion_every_s
+            for number, (frame, moved) in enumerate(zip(frames, motion)):
+                if moved and frame is not None:
+                    self.motion.append(self._write("motion", number, ts, frame))
+                    changed = True
+            while len(self.motion) > self.keep:
+                self._remove(self.motion.pop(0))
+        if changed:
+            from upload import write_atomic
+
+            index = {
+                "live": [entries[-1] for _, entries in sorted(self.live.items())],
+                "motion": self.motion,
+            }
+            write_atomic(self.folder / self.INDEX, json.dumps(index).encode())
+
+    def _write(self, kind: str, number: int, ts: float, frame: np.ndarray) -> dict:
+        from upload import write_atomic
+
+        height, width = frame.shape[:2]
+        if width > SNAPSHOT_WIDTH:
+            size = (SNAPSHOT_WIDTH, max(1, round(height * SNAPSHOT_WIDTH / width)))
+            frame = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+        name = f"{kind}-{number}-{int(ts * 1000)}.jpg"
+        write_atomic(self.folder / name, encode_jpeg(frame, SNAPSHOT_QUALITY))
+        camera = self.cameras[number] if number < len(self.cameras) else f"camera {number}"
+        return {"file": name, "camera": camera, "ts": ts}
+
+    def _remove(self, entry: dict) -> None:
+        (self.folder / entry["file"]).unlink(missing_ok=True)
+
+
 # --- Service -----------------------------------------------------------------
 
 
@@ -348,9 +472,15 @@ def run(args: argparse.Namespace) -> int:
             "min_fraction": settings.min_fraction,
         },
     )
+    snapshots = None
+    if args.snapshots:
+        snapshots = Snapshots(Path(args.snapshots), [camera_name(reader.device) for reader in readers])
     stop_upload = threading.Event()
     if not args.no_upload:
-        uploader = Uploader(data, DeviceToken(Path(args.device_token)), args.worker_url or WORKER_URL)
+        uploader = Uploader(
+            data, DeviceToken(Path(args.device_token)), args.worker_url or WORKER_URL,
+            status=Path(args.snapshots) / "upload.json" if args.snapshots else None,
+        )
         threading.Thread(target=uploader.run_forever, args=(stop_upload,), daemon=True).start()
 
     wait_for_clock()
@@ -370,14 +500,14 @@ def run(args: argparse.Namespace) -> int:
             frames = [reader.latest() for reader in readers]
             if all(frame is None for frame in frames):
                 continue
-            motion = False
-            for detector, frame in zip(detectors, frames):
-                if frame is not None and detector.update(frame):
-                    motion = True
+            moved = [frame is not None and detector.update(frame) for detector, frame in zip(detectors, frames)]
+            motion = any(moved)
             # Every frame is encoded: the pre-roll buffer needs the frames
             # from before motion started.
             ts = time.time()
             motion_filter.process(ts, encode_jpeg(compose(frames, tiles)), motion)
+            if snapshots is not None:
+                snapshots.update(ts, frames, moved)
             sink.tick(ts)
             if time.monotonic() - last_report >= 300:
                 last_report = time.monotonic()
@@ -403,6 +533,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data", default=DEFAULT_DATA, help="work and upload queue folder")
     parser.add_argument("--device-token", default="/etc/easysort/device-token", help="the token from enrolment")
     parser.add_argument("--worker-url", help="device-storage base URL (default: production Worker)")
+    parser.add_argument("--snapshots", help="folder for the camera check page's images (default: none)")
     parser.add_argument("--no-upload", action="store_true", help="queue windows locally only")
     parser.add_argument("--pre-s", type=float, default=defaults.pre_s)
     parser.add_argument("--post-s", type=float, default=defaults.post_s)

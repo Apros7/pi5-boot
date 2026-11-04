@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -125,6 +126,13 @@ class DeviceToken:
         self._token = ""
 
 
+def write_atomic(path: Path, data: bytes) -> None:
+    """Readers (the camera check page) never see a half-written file."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -142,6 +150,7 @@ class Uploader:
         http: Callable = http_request,
         cap_bytes: int = DEFAULT_CAP_BYTES,
         free_bytes: Callable[[Path], int] = lambda path: shutil.disk_usage(path).free,
+        status: Path | None = None,
     ) -> None:
         self.queue = data_dir / "queue"
         self.parked = self.queue / "parked"
@@ -152,6 +161,10 @@ class Uploader:
         self.cap_bytes = cap_bytes
         self.free_bytes = free_bytes
         self.uploaded = 0
+        # The last upload attempt, also written to `status` (JSON) for the
+        # camera check page.
+        self.status = status
+        self.last: dict | None = None
 
     def windows(self) -> list[Path]:
         """Complete windows (sidecar written), oldest first, as their .json path."""
@@ -165,6 +178,7 @@ class Uploader:
         if not self.windows():
             return 0
         if not self.login.available():
+            self.note("", "waiting for the device token (not enrolled yet)")
             return 60.0
         for sidecar in self.windows():
             mp4 = sidecar.with_suffix(".mp4")
@@ -192,6 +206,7 @@ class Uploader:
         key = f"{path.parent.name}/{path.name}"
         if size > MAX_UPLOAD_BYTES:
             log.error("%s is %d bytes, over the upload limit", key, size)
+            self.note(key, "too big, parked")
             return "park"
         digest = sha256_file(path)
         for attempt in range(2):
@@ -199,6 +214,7 @@ class Uploader:
                 token = self.login.token()
             except (LoginError, OSError) as error:
                 log.warning("No device login: %s", error)
+                self.note(key, "no valid device token")
                 return float(RETRY_MIN_S * 4)
             url = f"{self.worker_url}/{self.login.organization}/{self.login.device}/{key}"
             try:
@@ -215,25 +231,39 @@ class Uploader:
                 )
             except OSError as error:
                 log.warning("Upload of %s failed: %s", key, error)
+                self.note(key, f"failed, retrying: {error}")
                 return float(RETRY_MIN_S)
             if reply.status == 201:
                 log.info("Uploaded %s: 201 %s", key, json.dumps(reply.body))
+                self.note(key, "stored (201)")
                 return "done"
             if reply.status == 409:
                 if reply.body.get("sha256") == digest:
                     log.info("%s was already uploaded", key)
+                    self.note(key, "already stored (409, same content)")
                     return "done"
                 log.error("%s exists in R2 with different content", key)
+                self.note(key, "refused: exists with different content (409), parked")
                 return "park"
             if reply.status == 401 and attempt == 0:
                 self.login.renew()
                 continue
             if reply.status in PARK:
                 log.error("Upload of %s refused: %s %s", key, reply.status, reply.body)
+                self.note(key, f"refused ({reply.status}), parked")
                 return "park"
             log.warning("Upload of %s: %s %s; retrying later", key, reply.status, reply.body)
+            self.note(key, f"{reply.status}, retrying")
             return float(reply.retry_after or RETRY_MIN_S)
         return float(RETRY_MIN_S)
+
+    def note(self, key: str, result: str) -> None:
+        self.last = {"at": time.time(), "file": key, "result": result}
+        if self.status is not None:
+            try:
+                write_atomic(self.status, json.dumps(self.last).encode())
+            except OSError:
+                pass  # only the check page reads it
 
     def park(self, sidecar: Path) -> None:
         target = self.parked / sidecar.parent.name

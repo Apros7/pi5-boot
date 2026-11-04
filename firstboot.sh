@@ -10,6 +10,9 @@
 #    /etc/easysort/packages-ready, which easysort-motion waits for.
 # 3. Installs Tailscale and joins with the one-time auth key, then deletes it.
 # 4. Enrols with the Worker, saves the device token, deletes the enrolment code.
+# 5. Shares the camera check page (preview.py, 127.0.0.1:8080) on the tailnet
+#    as https://<hostname>.<tailnet>.ts.net/ with tailscale serve. Optional:
+#    a failure is only logged.
 set -u
 
 # Overridable only so the tests can run this script in a sandbox.
@@ -77,6 +80,13 @@ fi
 if [ -s "$ETC/device-token" ] && [ -f "$ETC/enroll.json" ]; then
   # The enrolment code is shared by every device: do not keep it.
   shred -u "$ETC/enroll.json"
+fi
+
+if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+  # The same call again is a no-op. timeout: serve waits for a click if the
+  # tailnet has HTTPS turned off.
+  timeout 60 tailscale serve --bg --https=443 http://127.0.0.1:8080 >/dev/null ||
+    echo "tailscale serve failed; the camera page is still on 127.0.0.1:8080 (ssh -L 8080:127.0.0.1:8080)"
 fi
 
 exit "$failed"

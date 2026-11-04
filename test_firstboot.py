@@ -36,6 +36,7 @@ if [ $dir = 1 ]; then mkdir -p "$@"; else cp "$1" "$2"; fi
     "shred": '#!/bin/sh\nfor last; do :; done\nrm -f "$last"\n',
     "systemctl": "#!/bin/sh\nexit 0\n",
     "tailscale": '#!/bin/sh\necho "tailscale $*" >> "$LOG"\nexit "$TAILSCALE_RC"\n',
+    "timeout": '#!/bin/sh\nshift\nexec "$@"\n',
 }
 
 FAILING_ENROLL = "import sys\nsys.exit(1)\n"
@@ -102,6 +103,17 @@ class FirstbootTests(unittest.TestCase):
         self.assertEqual(self.run_firstboot(packages_installed=True, tailscale_rc=0), 0)
         self.assertFalse((self.etc / "tailscale-authkey").exists())
         self.assertFalse((self.etc / "enroll.json").exists())
+        self.assertIn("tailscale serve --bg --https=443 http://127.0.0.1:8080", self.log.read_text())
+
+    def test_no_serve_without_tailscale_and_serve_failure_is_not_fatal(self) -> None:
+        self.run_firstboot(packages_installed=True, tailscale_rc=1)
+        self.assertNotIn("tailscale serve", self.log.read_text())
+        (self.etc / "device-token").write_text("esd1.acme.yard-09." + "x" * 43 + "\n")
+        (self.bin / "tailscale").write_text(
+            '#!/bin/sh\necho "tailscale $*" >> "$LOG"\n[ "$1" = serve ] && exit 1\nexit 0\n'
+        )
+        self.assertEqual(self.run_firstboot(packages_installed=True, tailscale_rc=0), 0)
+        self.assertIn("tailscale serve", self.log.read_text())
 
 
 class MotionUnitTests(unittest.TestCase):

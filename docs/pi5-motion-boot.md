@@ -148,13 +148,41 @@ folder without touching a disk or asking anything.
 
 ```bash
 tailscale ssh easysort@<org>-<device>
-systemctl status easysort-firstboot easysort-motion
+systemctl status easysort-firstboot easysort-motion easysort-preview
 journalctl -u easysort-firstboot -b      # "Enrolled as <org>/<device>", "Joined Tailscale as ..."
 journalctl -u easysort-motion -f         # every 5 min: frames, motion, kept, clips
 ls /var/lib/easysort-motion/queue         # windows waiting to upload
 ```
 
 Uploaded windows are in R2 under `reuse-detection/<org>/<device>/`.
+
+### Camera check page
+
+Open `https://<org>-<device>.<tailnet>.ts.net/` from a device on the tailnet
+(the tailnet name is in the Tailscale admin console under DNS). It shows each
+camera's newest frame (taken every 5 s) and the last 5 motion frames, with
+local and UTC time and the camera's name, plus the recording service's state
+and uptime, the last upload result, the queue size, CPU temperature,
+`vcgencmd get_throttled` in words and the network interface in use (`eth1`
+is the 4G dongle).
+
+It is built for 4G data: no auto refresh, no scripts, no video; reload to
+look again. The page is a few KB and never cached. Images are at most 960 px
+wide at JPEG quality 70 (about 100 KB) and cached by the browser, so a reload
+only fetches the new ones.
+
+- `motion_capture.py` writes the images to `/run/easysort-motion` (RAM, no
+  SD-card writes). Errors there are logged once and never stop recording.
+- `easysort-preview.service` (`preview.py`, standard library only) is
+  read-only, runs as `easysort` and listens on `127.0.0.1:8080` only.
+  Recording does not depend on it.
+- `firstboot.sh` shares it on the tailnet with
+  `tailscale serve --bg --https=443 http://127.0.0.1:8080` at every boot, so
+  it is never reachable from the LAN, Wi-Fi or 4G side. This needs HTTPS
+  certificates turned on for the tailnet (they are for Easysort's) and an
+  ACL that lets you reach the device on port 443. If serve is not set up:
+  `tailscale ssh -L 8080:127.0.0.1:8080 easysort@<org>-<device>` (or plain
+  `ssh -L`), then open `http://127.0.0.1:8080/`.
 
 ## Where secrets are
 

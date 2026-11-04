@@ -16,8 +16,12 @@ Environment=PYTHONUNBUFFERED=1
 # are not waited for: windows queue until the device token exists.
 ExecStartPre=/bin/sh -c 'until [ -f /etc/easysort/packages-ready ]; do sleep 5; done'
 TimeoutStartSec=infinity
-ExecStart=/usr/bin/python3 /opt/easysort-motion/motion_capture.py --data /var/lib/easysort-motion --device-token /etc/easysort/device-token
+ExecStart=/usr/bin/python3 /opt/easysort-motion/motion_capture.py --data /var/lib/easysort-motion --device-token /etc/easysort/device-token --snapshots /run/easysort-motion
 StateDirectory=easysort-motion
+# Images for the camera check page, in RAM. Kept over a restart.
+RuntimeDirectory=easysort-motion
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
 Restart=always
 RestartSec=10
 # On stop, SIGTERM only motion_capture.py; it closes ffmpeg's stdin so the

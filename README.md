@@ -25,6 +25,9 @@ and the card, then writes the card. The Pi enrols itself on first boot. Put the
 card in the Pi, plug in the camera(s), then power. The first start takes
 about 10 minutes; after that the Pi records whenever it has power.
 
+To check the cameras, open `https://<org>-<device>.<tailnet>.ts.net/` from a
+device on the tailnet. No auto refresh, to save 4G data: reload to look again.
+
 ## Files
 
 | File | Runs on | What it does |
@@ -35,6 +38,7 @@ about 10 minutes; after that the Pi records whenever it has power.
 | `motion_capture.py` | Pi, as `easysort-motion.service` | Cameras, motion check, 15-minute windows. |
 | `windows.py` | Pi | Fuses each window's kept frames into one mp4 and a JSON sidecar. |
 | `upload.py` | Pi | Uploads queued windows to R2 through the device-storage Worker. |
+| `preview.py` | Pi, as `easysort-preview.service` | Camera check page: newest frames and health, on the tailnet only. |
 
 ## Tests
 
