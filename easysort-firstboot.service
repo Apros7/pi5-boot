@@ -1,0 +1,14 @@
+[Unit]
+Description=Easysort first boot: secrets, packages and Tailscale
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/easysort-firstboot
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

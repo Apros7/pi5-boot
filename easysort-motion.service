@@ -1,0 +1,22 @@
+[Unit]
+Description=Easysort motion recording (15-minute windows to R2)
+Wants=network-online.target
+After=network-online.target easysort-firstboot.service
+# Keep retrying forever: the camera or network may come later.
+StartLimitIntervalSec=0
+
+[Service]
+User=easysort
+Group=easysort
+SupplementaryGroups=video
+WorkingDirectory=/opt/easysort-motion
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/easysort-motion/motion_capture.py --data /var/lib/easysort-motion --device-env /etc/easysort/device.env
+StateDirectory=easysort-motion
+Restart=always
+RestartSec=10
+# Let the open ffmpeg part finish on stop.
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
