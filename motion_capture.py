@@ -10,7 +10,7 @@ motion to 2 s after it. Frames without motion are dropped.
 
 The kept frames of each UTC quarter hour become one mp4 plus a JSON sidecar
 (windows.py), and upload.py sends both to R2 through the device-storage
-Worker with the device's own login.
+Worker with the token the Pi got when it enrolled.
 """
 
 from __future__ import annotations
@@ -312,7 +312,7 @@ def start_cameras(devices: list[str]) -> list[CameraReader]:
 
 
 def run(args: argparse.Namespace) -> int:
-    from upload import DeviceLogin, Uploader, WORKER_URL
+    from upload import DeviceToken, Uploader, WORKER_URL
     from windows import WindowSink
 
     data = Path(args.data)
@@ -350,7 +350,7 @@ def run(args: argparse.Namespace) -> int:
     )
     stop_upload = threading.Event()
     if not args.no_upload:
-        uploader = Uploader(data, DeviceLogin(Path(args.device_env)), args.worker_url or WORKER_URL)
+        uploader = Uploader(data, DeviceToken(Path(args.device_token)), args.worker_url or WORKER_URL)
         threading.Thread(target=uploader.run_forever, args=(stop_upload,), daemon=True).start()
 
     wait_for_clock()
@@ -401,7 +401,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--camera", action="append", help="camera device (repeatable; default: every USB camera)")
     parser.add_argument("--data", default=DEFAULT_DATA, help="work and upload queue folder")
-    parser.add_argument("--device-env", default="/etc/easysort/device.env", help="the device login")
+    parser.add_argument("--device-token", default="/etc/easysort/device-token", help="the token from enrolment")
     parser.add_argument("--worker-url", help="device-storage base URL (default: production Worker)")
     parser.add_argument("--no-upload", action="store_true", help="queue windows locally only")
     parser.add_argument("--pre-s", type=float, default=defaults.pre_s)

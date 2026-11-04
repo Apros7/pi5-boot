@@ -16,7 +16,7 @@ from unittest import mock
 import numpy as np
 
 import flash
-from flash import DeviceLogin, FlashError
+from flash import Enrolment, FlashError
 from motion_capture import (
     CameraReader,
     MotionDetector,
@@ -180,12 +180,12 @@ class CameraReaderTests(unittest.TestCase):
         reader.stop()
 
 
-LOGIN = DeviceLogin("acme", "yard-09", flash.device_email("acme", "yard-09"), "pw 'quoted'")
+ENROL = Enrolment("acme", "yard-09", "code 'quoted' secret")
 
 
 class CardTests(unittest.TestCase):
     def files(self, **kwargs) -> dict[str, str]:
-        args = dict(login=LOGIN, auth_key="tskey-auth-SECRET1", ssid='Site "Wi-Fi"', wifi_password="hunter22",
+        args = dict(enrolment=ENROL, auth_key="tskey-auth-SECRET1", ssid='Site "Wi-Fi"', wifi_password="hunter22",
                     ssh_keys=[], suffix="abcd", tag=None)
         args.update(kwargs)
         return flash.card_files(**args)
@@ -197,16 +197,11 @@ class CardTests(unittest.TestCase):
         self.assertNotIn("hunter22", files["user-data"])
         self.assertEqual(files["easysort/tailscale-authkey"], "tskey-auth-SECRET1\n")
 
-    def test_device_env_round_trips(self) -> None:
-        from upload import read_env
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "device.env"
-            path.write_text(self.files()["easysort/device.env"])
-            env = read_env(path)
-        self.assertEqual(env["DEVICE_PASSWORD"], "pw 'quoted'")
-        self.assertEqual(env["DEVICE_EMAIL"], "recycling-acme-yard-09@devices.invalid")
-        self.assertEqual(env["SUPABASE_URL"], flash.SUPABASE_URL)
+    def test_enrolment_file(self) -> None:
+        self.assertEqual(
+            json.loads(self.files()["easysort/enroll.json"]),
+            {"enroll_code": "code 'quoted' secret", "org": "acme", "device": "yard-09"},
+        )
 
     def test_hostname_and_settings(self) -> None:
         files = self.files(tag="tag:pi")
@@ -241,7 +236,7 @@ class CardTests(unittest.TestCase):
             out = Path(tmp)
             with mock.patch("sys.stdout", io.StringIO()):
                 self.assertEqual(flash.main(["--dry-run", str(out), "--organization", "acme", "--device", "x-01"]), 0)
-            for name in ("user-data", "network-config", "meta-data", "easysort/device.env",
+            for name in ("user-data", "network-config", "meta-data", "easysort/enroll.json",
                          "easysort/tailscale-authkey", "easysort/settings.json"):
                 self.assertTrue((out / name).is_file(), name)
             for name in flash.APP_FILES:
@@ -261,43 +256,54 @@ class Reply(io.BytesIO):
         return False
 
 
-class LoginTests(unittest.TestCase):
-    def reply(self, organization: str, device: str):
-        body = {"access_token": "t", "user": {"app_metadata": {"organization_name": organization, "device_name": device}}}
+class EnrolmentCheckTests(unittest.TestCase):
+    def answer(self, status: int = 200, body: dict | None = None):
         seen = {}
 
         def urlopen(request, timeout):
             seen["url"] = request.full_url
             seen["body"] = json.loads(request.data)
             seen["headers"] = dict(request.header_items())
-            return Reply(json.dumps(body).encode())
+            if status != 200:
+                raise urllib.error.HTTPError(request.full_url, status, "error", {}, io.BytesIO(b"{}"))
+            return Reply(json.dumps(body or {"ok": True, "available": True}).encode())
 
         return urlopen, seen
 
-    def test_matching_login(self) -> None:
-        urlopen, seen = self.reply("acme", "yard-09")
-        flash.verify_login(LOGIN, urlopen)
-        self.assertTrue(seen["url"].endswith("/auth/v1/token?grant_type=password"))
-        self.assertEqual(seen["body"]["email"], LOGIN.email)
+    def test_free_name_and_right_code(self) -> None:
+        urlopen, seen = self.answer()
+        flash.check_enrolment(ENROL, urlopen)
+        self.assertEqual(seen["url"], "https://worker.easysort.org/device-storage/v1/enroll/check")
+        self.assertEqual(seen["body"], {"enroll_code": "code 'quoted' secret", "org": "acme", "device": "yard-09"})
         self.assertEqual(seen["headers"]["User-agent"], "easysort-edge/1")
 
-    def test_login_for_another_device(self) -> None:
-        urlopen, _ = self.reply("acme", "other-01")
-        with self.assertRaisesRegex(FlashError, "acme/other-01"):
-            flash.verify_login(LOGIN, urlopen)
+    def test_name_already_enrolled(self) -> None:
+        urlopen, _ = self.answer(body={"ok": True, "available": False})
+        with self.assertRaisesRegex(FlashError, "acme/yard-09 is already enrolled"):
+            flash.check_enrolment(ENROL, urlopen)
 
-    def test_wrong_password(self) -> None:
+    def test_wrong_code(self) -> None:
+        urlopen, _ = self.answer(403)
+        with self.assertRaisesRegex(FlashError, "refused the enrolment code"):
+            flash.check_enrolment(ENROL, urlopen)
+
+    def test_not_configured(self) -> None:
+        urlopen, _ = self.answer(503)
+        with self.assertRaisesRegex(FlashError, "not set up"):
+            flash.check_enrolment(ENROL, urlopen)
+
+    def test_offline_suggests_no_check(self) -> None:
         def urlopen(request, timeout):
-            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(b"{}"))
+            raise urllib.error.URLError("no route")
 
-        with self.assertRaisesRegex(FlashError, "refused the login"):
-            flash.verify_login(LOGIN, urlopen)
+        with self.assertRaisesRegex(FlashError, "--no-check"):
+            flash.check_enrolment(ENROL, urlopen)
 
-    def test_ask_login_derives_the_email(self) -> None:
+    def test_ask_enrolment(self) -> None:
         answers = iter(["Acme", "yard-09"])
         with mock.patch("sys.stdout", io.StringIO()):
-            login = flash.ask_login(None, None, ask=lambda _: next(answers), ask_secret=lambda _: "pw")
-        self.assertEqual(login, DeviceLogin("acme", "yard-09", "recycling-acme-yard-09@devices.invalid", "pw"))
+            enrolment = flash.ask_enrolment(None, None, ask=lambda _: next(answers), ask_secret=lambda _: " code ")
+        self.assertEqual(enrolment, Enrolment("acme", "yard-09", "code"))
 
     def test_auth_key_format(self) -> None:
         self.assertEqual(flash.ask_auth_key(lambda _: " tskey-auth-abc123 "), "tskey-auth-abc123")
@@ -393,7 +399,7 @@ class FilesTests(unittest.TestCase):
     def test_units_point_at_the_installed_paths(self) -> None:
         unit = (HERE / "easysort-motion.service").read_text()
         self.assertIn(f"{flash.APP_DIR}/motion_capture.py", unit)
-        self.assertIn("/etc/easysort/device.env", unit)
+        self.assertIn("/etc/easysort/device-token", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
         self.assertIn("/usr/local/sbin/easysort-firstboot", (HERE / "easysort-firstboot.service").read_text())
 

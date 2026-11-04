@@ -18,24 +18,30 @@ flash.py (Mac/Linux)            Pi 5, first boot                    Pi 5, every 
 --------------------            ----------------                    ----------------
 Wi-Fi from this computer  ->    cloud-init: user, hostname,         easysort-firstboot (no-op once done)
 Tailscale auth key              copies app to /opt/easysort-motion  easysort-motion.service:
-device login (checked)          easysort-firstboot:                   cameras -> motion -> 15-min mp4
-Raspberry Pi OS Lite              secrets -> /etc/easysort             -> upload via Worker -> R2
-  + first-boot files              apt: python3-opencv, ffmpeg
-                                  Tailscale join (--ssh), key deleted
+org, device, enrol code        easysort-firstboot:                   cameras -> motion -> 15-min mp4
+  (checked with the Worker)       secrets -> /etc/easysort             -> upload via Worker -> R2
+Raspberry Pi OS Lite              apt: python3-opencv, ffmpeg
+  + first-boot files              Tailscale join (--ssh), key deleted
+                                  enrol -> device token, code deleted
 ```
 
-1. `flash.py` asks for the Wi-Fi, the Tailscale auth key and the device
-   login, checks the login against Supabase, then writes stock 64-bit
+1. `flash.py` asks for the Wi-Fi, the Tailscale auth key, the organization,
+   a device name and the enrolment code, checks the code and that the name
+   is free with the Worker, then writes stock 64-bit
    Raspberry Pi OS Lite (Trixie, 2026-10-06, checksum pinned) and the
    first-boot files.
 2. On first boot cloud-init creates the `easysort` user (no password; reach
    it with Tailscale SSH or an `--ssh-key`), sets the hostname to
    `<organization>-<device>` and installs two systemd units.
-3. `easysort-firstboot.service` moves the device login and the Tailscale key
-   off the FAT boot partition into `/etc/easysort/`, installs
+3. `easysort-firstboot.service` moves the enrolment file and the Tailscale
+   key off the FAT boot partition into `/etc/easysort/`, installs
    `python3-opencv python3-numpy ffmpeg`, installs Tailscale, joins with
-   `--ssh` and deletes the key. It runs at every boot and retries every 30 s
-   until it succeeds, so a Pi that starts without network catches up.
+   `--ssh` and deletes the key. Then `enroll.py` enrols the device with the
+   Worker, saves its token in `/etc/easysort/device-token` (0600, owned by
+   `easysort`) and the enrolment code is deleted. It runs at every boot and
+   retries every 30 s until every step has succeeded, so a Pi that starts
+   without network catches up. A failed step does not stop the others, so
+   the Pi still joins Tailscale when enrolment is stuck.
 4. `easysort-motion.service` runs `motion_capture.py` at every boot and
    restarts it if it stops.
 
@@ -69,26 +75,38 @@ Through Easysort's device-storage Worker:
 
 ```
 PUT https://worker.easysort.org/device-storage/v1/reuse-detection/<org>/<device>/<YYYY-MM-DD>/<HHMM>.mp4|json
-Authorization: Bearer <device's Supabase access token>
+Authorization: Bearer <device token>
 ```
 
-`upload.py` reads the login from `/etc/easysort/device.env`. The mp4 goes up
-before the JSON, 409 with the same
+`upload.py` reads the token from `/etc/easysort/device-token`. The token is
+`esd1.<org>.<device>.<random>`, so it also gives the path. Until the Pi has
+enrolled, windows wait in the queue. The mp4 goes up before the JSON, 409
+with the same
 sha256 counts as done, and a queue of up to 8 GB waits on the Pi while it is
 offline (oldest windows are deleted beyond that or below 2 GB free).
 
-The Pi never holds an R2 key: R2 tokens cannot be limited to a prefix. It
-logs in as its own Supabase device user, and the Worker only accepts uploads
-under that user's `<org>/<device>`.
+The Pi never holds an R2 key: R2 tokens cannot be limited to a prefix. Its
+token only lets it write below its own `<org>/<device>`.
 
-## Making a device login (admin)
+## Enrolment (admin)
 
-The person flashing needs the organization, device name and device password.
-An Easysort admin makes the login once per device with Easysort's internal
-provisioning tool (`provision.py create <organization> <device-name>`) and
-sends the password to the person flashing through a password manager, not
-chat. The email `recycling-<org>-<device>@devices.invalid` is derived by
-`flash.py`, so it is not needed. The same tool revokes a lost device.
+The Pi enrols itself on first boot with a shared **enrolment code**, so
+nobody needs an account made for each device:
+
+```
+POST https://worker.easysort.org/device-storage/v1/enroll        {"enroll_code","org","device"}
+  201 {"token","org","device"}   the device's own token, returned once
+  409 that device name is already enrolled (nobody can take it over)
+  403 wrong code, 503 enrolment not set up
+POST https://worker.easysort.org/device-storage/v1/enroll/check  same body
+  200 {"ok":true,"available"}    checks the code and the name, enrols nothing
+```
+
+The Worker keeps one record per device with only a hash of its token.
+Easysort sets the enrolment code(s) as a Worker secret and gives the code to
+the people who set up devices. The code can be changed at any time; devices
+that already enrolled keep working. An admin can revoke a device, which stops
+its uploads at once, or free its name so a replacement Pi can enrol under it.
 
 Also make a Tailscale auth key (admin console, Settings, Keys): reusable or
 one-off, pre-approved, and tagged if your ACL uses tags (then pass `--tag`).
@@ -109,8 +127,10 @@ python3 flash.py
    for permission to read it from the Keychain) and shows only its first and
    last character to confirm. The password can also be typed.
 2. **Tailscale auth key**, at a hidden prompt.
-3. **Device login**: organization, device name, password (hidden). The
-   script signs in once to check it and stops if it is wrong.
+3. **Device**: organization, a name for this device (e.g. `yard-01`) and the
+   enrolment code (hidden). The script checks the code and that the name is
+   free, and stops if not. With no internet on the computer, `--no-check`
+   skips this; the Pi then finds out on first boot.
 4. **Card.** Cards (removable, 8-256 GB) are listed; the system disk is never
    offered. Type the disk name to confirm erasing it. `sudo` asks for the
    computer's password to write the card.
@@ -126,6 +146,7 @@ folder without touching a disk or asking anything.
 ```bash
 tailscale ssh easysort@<org>-<device>
 systemctl status easysort-firstboot easysort-motion
+journalctl -u easysort-firstboot -b      # "Enrolled as <org>/<device>", "Joined Tailscale as ..."
 journalctl -u easysort-motion -f         # every 5 min: frames, motion, kept, clips
 ls /var/lib/easysort-motion/queue         # windows waiting to upload
 ```
@@ -138,10 +159,8 @@ Uploaded windows are in R2 under `reuse-detection/<org>/<device>/`.
 |---|---|---|---|
 | Wi-Fi password | flash.py (or read from this computer) | `network-config` | NetworkManager, and `network-config` stays on the boot partition |
 | Tailscale auth key | flash.py | `easysort/tailscale-authkey` until first boot | deleted after joining |
-| Device password | flash.py | `easysort/device.env` until first boot | `/etc/easysort/device.env` (0640 root:easysort) |
-
-The Supabase URL and publishable key in `flash.py` are public client values;
-access depends on the device login.
+| Enrolment code | flash.py | `easysort/enroll.json` until first boot | `/etc/easysort/enroll.json` (0600 root) until enrolled, then deleted |
+| Device token | (made by the Worker) | never | `/etc/easysort/device-token` (0600 easysort) |
 
 ## Not done yet
 

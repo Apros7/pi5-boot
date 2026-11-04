@@ -4,19 +4,20 @@ Contract:
 
     PUT https://worker.easysort.org/device-storage/v1/reuse-detection/
         <org>/<device>/<YYYY-MM-DD>/<HHMM>.(mp4|json)
-    Authorization: Bearer <the device's Supabase access token>
+    Authorization: Bearer <the device token from enrolment>
     Content-Type: video/mp4 | application/json
     X-Content-SHA256: <64 lowercase hex>
 
 201 stored. 409 already there, with the stored sha256: a match means an
-earlier upload got through. 401 refresh the login and try once more. 429, 5xx
-and 503 (Supabase Auth down) retry later. 400, 403, 411, 413 and 415 will not
+earlier upload got through. 401 read the token file again and try once more
+(401 "revoked" means an admin revoked the device). 429, 5xx and 503 retry
+later. 400, 403, 411, 413 and 415 will not
 change on retry, so the file is parked in ``queue/parked/``.
 
-The device logs in with its own Supabase account (an Easysort admin makes
-it). flash.py writes the login to ``/etc/easysort/device.env`` on the
-card. Its ``app_metadata.organization_name`` and ``device_name`` give the
-path. Until that login exists, windows stay in the local queue.
+The Pi enrols itself on first boot (enroll.py) and keeps its token in
+``/etc/easysort/device-token``. The token is ``esd1.<org>.<device>.<random>``,
+so it also gives the upload path. Until the token exists, windows stay in
+the local queue.
 
 The mp4 goes up first and the sidecar last, so a ``.json`` in the bucket
 means the window is complete. When the queue grows past the disk cap the
@@ -28,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import shlex
+import re
 import shutil
 import threading
 import time
@@ -40,8 +41,10 @@ from typing import Callable
 
 log = logging.getLogger("pi5-motion")
 
-WORKER_URL = "https://worker.easysort.org/device-storage/v1/reuse-detection"
-DEVICE_ENV = Path("/etc/easysort/device.env")
+WORKER_BASE = "https://worker.easysort.org/device-storage/v1"
+WORKER_URL = f"{WORKER_BASE}/reuse-detection"
+DEVICE_TOKEN = Path("/etc/easysort/device-token")
+TOKEN_RE = re.compile(r"^esd1\.([a-z0-9][a-z0-9-]{0,62})\.([a-z0-9][a-z0-9-]{0,62})\.[A-Za-z0-9_-]{43}$")
 MAX_UPLOAD_BYTES = 99_614_720
 DEFAULT_CAP_BYTES = 8 * 1024**3
 MIN_FREE_BYTES = 2 * 1024**3
@@ -91,76 +94,35 @@ def _json(raw: bytes) -> dict:
     return value if isinstance(value, dict) else {"value": value}
 
 
-def read_env(path: Path) -> dict[str, str]:
-    """KEY=value lines with shell-quoted values, as flash.py writes them."""
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, raw = line.split("=", 1)
-        parts = shlex.split(raw)
-        values[key.strip()] = parts[0] if parts else ""
-    return values
-
-
 class LoginError(RuntimeError):
     pass
 
 
-class DeviceLogin:
-    """The device's own Supabase session, signed in with its .env password."""
+class DeviceToken:
+    """The token the Pi got when it enrolled. The organization and device are part of it."""
 
-    def __init__(self, env_path: Path = DEVICE_ENV, http: Callable = http_request, clock=time.time) -> None:
-        self.env_path = env_path
-        self.http = http
-        self.clock = clock
+    def __init__(self, path: Path = DEVICE_TOKEN) -> None:
+        self.path = path
         self._token = ""
-        self._refresh = ""
-        self._expires_at = 0.0
         self.organization = ""
         self.device = ""
 
     def available(self) -> bool:
-        return self.env_path.exists()
+        return self.path.exists()
 
     def token(self) -> str:
-        if not self._token or self.clock() >= self._expires_at - 60:
-            self.renew()
+        if not self._token:
+            value = self.path.read_text(encoding="utf-8").strip()
+            match = TOKEN_RE.fullmatch(value)
+            if not match:
+                raise LoginError(f"{self.path} does not hold a device token")
+            self._token = value
+            self.organization, self.device = match.group(1), match.group(2)
         return self._token
 
     def renew(self) -> None:
-        if self._refresh and self._grant("refresh_token", {"refresh_token": self._refresh}):
-            return
-        env = read_env(self.env_path)
-        if not self._grant("password", {"email": env.get("DEVICE_EMAIL", ""), "password": env.get("DEVICE_PASSWORD", "")}):
-            raise LoginError("Supabase sign-in failed")
-
-    def _grant(self, grant: str, payload: dict) -> bool:
-        env = read_env(self.env_path)
-        url, key = env.get("SUPABASE_URL", "").rstrip("/"), env.get("SUPABASE_PUBLISHABLE_KEY", "")
-        if not url or not key:
-            raise LoginError(f"SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY missing in {self.env_path}")
-        reply = self.http(
-            "POST",
-            f"{url}/auth/v1/token?grant_type={grant}",
-            {"apikey": key, "Content-Type": "application/json"},
-            json.dumps(payload).encode(),
-            60,
-        )
-        if reply.status != 200 or "access_token" not in reply.body:
-            log.warning("Supabase %s grant returned %s", grant, reply.status)
-            return False
-        body = reply.body
-        meta = (body.get("user") or {}).get("app_metadata") or {}
-        self._token = body["access_token"]
-        self._refresh = body.get("refresh_token", "")
-        self._expires_at = float(body.get("expires_at") or self.clock() + float(body.get("expires_in", 3600)))
-        self.organization = meta.get("organization_name", "")
-        self.device = meta.get("device_name", "")
-        if not self.organization or not self.device:
-            raise LoginError("The device login has no organization_name/device_name")
-        return True
+        """Read the file again on the next upload (a new enrolment may have replaced it)."""
+        self._token = ""
 
 
 def sha256_file(path: Path) -> str:
@@ -175,7 +137,7 @@ class Uploader:
     def __init__(
         self,
         data_dir: Path,
-        login: DeviceLogin,
+        login: DeviceToken,
         worker_url: str = WORKER_URL,
         http: Callable = http_request,
         cap_bytes: int = DEFAULT_CAP_BYTES,

@@ -1,4 +1,4 @@
-"""15-minute windows and the R2 upload queue, with a fake Worker and fake Supabase.
+"""15-minute windows and the R2 upload queue, with a fake Worker.
 
 The window tests run the real ffmpeg when it is installed (skipped otherwise).
 No network, camera or device login is used.
@@ -24,7 +24,7 @@ import numpy as np
 import upload
 import windows
 from motion_capture import Clip, MotionFilter, MotionSettings
-from upload import DeviceLogin, Response, Uploader, read_env
+from upload import DeviceToken, LoginError, Response, Uploader
 from windows import WINDOW_S, WindowSink, iso, window_key, window_start
 
 HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -163,25 +163,21 @@ class WindowSinkTests(unittest.TestCase):
         self.assertEqual(sidecar["frames"][0]["t"], iso(T0 + 3.0))
 
 
+TOKEN = "esd1.example.site-01." + "A" * 43
+
+
 class FakeCloud:
-    """Supabase /auth/v1/token and the device-storage Worker."""
+    """The device-storage Worker."""
 
     def __init__(self) -> None:
         self.objects: dict[str, str] = {}
         self.calls: list[tuple[str, str]] = []
+        self.auth: list[str] = []
         self.script: list[Response] = []
-        self.tokens = 0
 
     def __call__(self, method, url, headers, body=None, timeout=300):
         self.calls.append((method, url))
-        if "/auth/v1/token" in url:
-            self.tokens += 1
-            return Response(200, {
-                "access_token": f"token-{self.tokens}",
-                "refresh_token": "refresh",
-                "expires_in": 3600,
-                "user": {"app_metadata": {"organization_name": "example", "device_name": "site-01"}},
-            })
+        self.auth.append(headers["Authorization"])
         if self.script:
             return self.script.pop(0)
         data = body.read_bytes()
@@ -199,11 +195,8 @@ class UploaderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name)
-        self.env = self.data / "device.env"
-        self.env.write_text(
-            "SUPABASE_URL=https://example.supabase.co\nSUPABASE_PUBLISHABLE_KEY=sb_publishable_x\n"
-            "DEVICE_EMAIL=pi@example.org\nDEVICE_PASSWORD='p w'\n"
-        )
+        self.token_file = self.data / "device-token"
+        self.token_file.write_text(TOKEN + "\n")
         self.cloud = FakeCloud()
 
     def tearDown(self) -> None:
@@ -217,12 +210,23 @@ class UploaderTests(unittest.TestCase):
         return folder / f"{hhmm}.json"
 
     def uploader(self, **kwargs) -> Uploader:
-        login = DeviceLogin(self.env, http=self.cloud)
+        login = DeviceToken(self.token_file)
         return Uploader(self.data, login, "https://worker.test/device-storage/v1/reuse-detection",
                         http=self.cloud, free_bytes=lambda _: 10**12, **kwargs)
 
-    def test_reads_provisioned_env(self) -> None:
-        self.assertEqual(read_env(self.env)["DEVICE_PASSWORD"], "p w")
+    def test_token_gives_the_device(self) -> None:
+        login = DeviceToken(self.token_file)
+        self.assertEqual(login.token(), TOKEN)
+        self.assertEqual((login.organization, login.device), ("example", "site-01"))
+
+    def test_malformed_token_file_waits(self) -> None:
+        self.token_file.write_text("not a token\n")
+        with self.assertRaises(LoginError):
+            DeviceToken(self.token_file).token()
+        sidecar = self.queue("2026-10-30", "1200")
+        with self.assertLogs("pi5-motion", "WARNING"):
+            self.assertGreater(self.uploader().run_once(), 0)
+        self.assertTrue(sidecar.exists())
 
     def test_uploads_mp4_then_json_and_empties_queue(self) -> None:
         self.queue("2026-10-30", "1200")
@@ -235,7 +239,7 @@ class UploaderTests(unittest.TestCase):
             "example/site-01/2026-10-30/1215.mp4",
             "example/site-01/2026-10-30/1215.json",
         ])
-        self.assertEqual(self.cloud.tokens, 1)
+        self.assertEqual(set(self.cloud.auth), {f"Bearer {TOKEN}"})
         self.assertEqual(list((self.data / "queue").iterdir()), [])
 
     def test_matching_409_counts_as_uploaded(self) -> None:
@@ -252,12 +256,24 @@ class UploaderTests(unittest.TestCase):
         self.assertTrue((self.data / "queue" / "parked" / "2026-10-30" / "1200.mp4").exists())
         self.assertNotIn("example/site-01/2026-10-30/1200.json", self.cloud.objects)
 
-    def test_expired_token_is_refreshed_once(self) -> None:
+    def test_401_reads_the_token_file_again_once(self) -> None:
         self.queue("2026-10-30", "1200")
-        self.cloud.script = [Response(401, {"error": "jwt expired"})]
-        self.uploader().run_once()
-        self.assertEqual(self.cloud.tokens, 2)
+        self.cloud.script = [Response(401, {"error": "invalid token"})]
+        new = "esd1.example.site-01." + "B" * 43
+        self.token_file.write_text(new)  # e.g. the Pi enrolled again
+        uploader = self.uploader()
+        uploader.login._token = TOKEN
+        uploader.login.organization, uploader.login.device = "example", "site-01"
+        uploader.run_once()
+        self.assertEqual(self.cloud.auth[:2], [f"Bearer {TOKEN}", f"Bearer {new}"])
         self.assertEqual(len(self.cloud.objects), 2)
+
+    def test_revoked_device_keeps_its_windows(self) -> None:
+        sidecar = self.queue("2026-10-30", "1200")
+        self.cloud.script = [Response(401, {"error": "revoked"}), Response(401, {"error": "revoked"})]
+        with self.assertLogs("pi5-motion", "WARNING"):
+            self.assertGreater(self.uploader().run_once(), 0)
+        self.assertTrue(sidecar.exists() and sidecar.with_suffix(".mp4").exists())
 
     def test_server_error_keeps_the_window_for_later(self) -> None:
         sidecar = self.queue("2026-10-30", "1200")
@@ -275,15 +291,15 @@ class UploaderTests(unittest.TestCase):
         self.uploader().run_once()
         self.assertFalse(sidecar.exists())
 
-    def test_without_device_login_windows_stay_queued(self) -> None:
-        self.env.unlink()
+    def test_before_enrolment_windows_stay_queued(self) -> None:
+        self.token_file.unlink()
         sidecar = self.queue("2026-10-30", "1200")
         self.assertEqual(self.uploader().run_once(), 60)
         self.assertTrue(sidecar.exists())
         self.assertEqual(self.cloud.calls, [])
 
     def test_disk_cap_deletes_oldest_windows(self) -> None:
-        self.env.unlink()
+        self.token_file.unlink()
         old = self.queue("2026-10-29", "2345", size=600)
         new = self.queue("2026-10-30", "0000", size=600)
         with redirect_stderr(io.StringIO()):

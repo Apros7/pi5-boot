@@ -10,20 +10,20 @@ The script asks for, in order:
 1. The Wi-Fi the Pi should use. It reads the network this computer is on and
    its saved password, and asks you to confirm.
 2. The Tailscale auth key.
-3. The device login: organization, device name and device password, made
-   by an Easysort admin for this device. The login is checked against
-   Supabase before anything is written.
+3. The organization, a name for this device and the enrolment code (from
+   an Easysort admin). The code and the name are checked with the Worker
+   before anything is written.
 4. Which card to erase.
 
 The card gets stock 64-bit Raspberry Pi OS Lite plus a first-boot config. On
 first boot the Pi installs its packages, joins Tailscale as
-``<organization>-<device>`` and starts easysort-motion.service, which runs at
-every boot from then on. No R2 key is ever on the card: uploads go through
-the device-storage Worker with the device's own login.
+``<organization>-<device>``, enrols itself with the Worker (which gives it
+its own upload token) and starts easysort-motion.service, which runs at
+every boot from then on. No R2 key is ever on the card.
 
 Secrets are asked for at hidden prompts and written only to the card, never
 to this repository or the screen. The Pi moves them off the boot partition on
-first boot. Nothing but the Python standard library is needed.
+first boot and deletes the enrolment code once it has its token. Nothing but the Python standard library is needed.
 
 ``--dry-run DIR`` writes the boot files into DIR with placeholders, without
 touching a disk, the network or asking for secrets.
@@ -40,7 +40,6 @@ import os
 import plistlib
 import re
 import secrets
-import shlex
 import shutil
 import subprocess
 import sys
@@ -66,17 +65,15 @@ CACHE_DIR = (
     else Path.home() / "Library" / "Caches" / "easysort" / "raspios"
 )
 
-# Public client values (a publishable key is meant to be shipped to clients;
-# access is decided by the device's own login).
-SUPABASE_URL = "https://dbolnhzsjzwqsbkkljna.supabase.co"
-SUPABASE_PUBLISHABLE_KEY = "sb_publishable_kncBcFDFmPHLtzAJjlc-hQ_72v5-vLH"
+WORKER_BASE = "https://worker.easysort.org/device-storage/v1"
+# Cloudflare's bot check answers the default Python-urllib agent with 403 1010.
 USER_AGENT = "easysort-edge/1"
 
 USER = "easysort"
 APP_DIR = "/opt/easysort-motion"
 BOOT_DIR = "easysort"  # on the boot partition, /boot/firmware/easysort on the Pi
 WIFI_COUNTRY = "DK"
-APP_FILES = ("motion_capture.py", "windows.py", "upload.py", "firstboot.sh", "easysort-motion.service",
+APP_FILES = ("motion_capture.py", "windows.py", "upload.py", "enroll.py", "firstboot.sh", "easysort-motion.service",
              "easysort-firstboot.service", "README.md")
 
 MIN_CARD_BYTES = 8 * 1000**3
@@ -110,24 +107,18 @@ def _indent(text: str, spaces: int) -> str:
     return "".join(f"{pad}{line}\n" if line else "\n" for line in text.splitlines())
 
 
-# --- Device login --------------------------------------------------------------
+# --- Device and enrolment -------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class DeviceLogin:
+class Enrolment:
     organization: str
     device: str
-    email: str
-    password: str
+    code: str
 
     @property
     def hostname(self) -> str:
         return f"{self.organization}-{self.device}"
-
-
-def device_email(organization: str, device: str) -> str:
-    """The email Easysort gives a device user."""
-    return f"recycling-{organization}-{device}@devices.invalid"
 
 
 def check_name(value: str, what: str) -> str:
@@ -137,42 +128,45 @@ def check_name(value: str, what: str) -> str:
     return value
 
 
-def verify_login(login: DeviceLogin, http: Callable = urllib.request.urlopen) -> None:
-    """Sign in once, as the Pi will, and check the login is this device's."""
+def check_enrolment(enrolment: Enrolment, http: Callable = urllib.request.urlopen) -> None:
+    """Ask the Worker whether the code is right and the name is free, without enrolling."""
+    body = json.dumps(
+        {"enroll_code": enrolment.code, "org": enrolment.organization, "device": enrolment.device}
+    ).encode()
     request = urllib.request.Request(
-        f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
-        data=json.dumps({"email": login.email, "password": login.password}).encode(),
+        f"{WORKER_BASE}/enroll/check",
+        data=body,
         method="POST",
-        headers={"apikey": SUPABASE_PUBLISHABLE_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
     )
+    name = f"{enrolment.organization}/{enrolment.device}"
     try:
         with http(request, timeout=30) as reply:
-            body = json.loads(reply.read() or b"{}")
+            answer = json.loads(reply.read() or b"{}")
     except urllib.error.HTTPError as error:
-        if error.code in (400, 401):
-            raise FlashError(
-                f"Supabase refused the login for {login.organization}/{login.device}. "
-                "Check the organization, device name and password."
-            ) from error
-        raise FlashError(f"Supabase answered {error.code} when checking the login") from error
+        if error.code == 403:
+            raise FlashError("The Worker refused the enrolment code. Check it with the admin.") from error
+        if error.code == 400:
+            raise FlashError(f"The Worker refused the name {name}") from error
+        if error.code == 503:
+            raise FlashError("Enrolment is not set up on the Worker yet (no ENROLL_CODE). Ask the admin.") from error
+        raise FlashError(f"The Worker answered {error.code} when checking the enrolment code") from error
     except (urllib.error.URLError, OSError) as error:
-        raise FlashError(f"Could not reach Supabase to check the login: {error}") from error
-    meta = (body.get("user") or {}).get("app_metadata") or {}
-    found = (meta.get("organization_name"), meta.get("device_name"))
-    if found != (login.organization, login.device):
-        raise FlashError(f"The login belongs to {found[0]}/{found[1]}, not {login.organization}/{login.device}")
+        raise FlashError(
+            f"Could not reach the Worker to check the enrolment code: {error}. "
+            "Run again with --no-check to write the card anyway."
+        ) from error
+    if not answer.get("available"):
+        raise FlashError(
+            f"{name} is already enrolled. Choose another device name, or ask the admin to free it "
+            "if this Pi replaces the old one."
+        )
 
 
-def render_device_env(login: DeviceLogin) -> str:
-    values = {
-        "SUPABASE_URL": SUPABASE_URL,
-        "SUPABASE_PUBLISHABLE_KEY": SUPABASE_PUBLISHABLE_KEY,
-        "DEVICE_EMAIL": login.email,
-        "DEVICE_PASSWORD": login.password,
-        "ORGANIZATION_NAME": login.organization,
-        "DEVICE_NAME": login.device,
-    }
-    return "".join(f"{key}={shlex.quote(value)}\n" for key, value in values.items())
+def render_enroll(enrolment: Enrolment) -> str:
+    return json.dumps(
+        {"enroll_code": enrolment.code, "org": enrolment.organization, "device": enrolment.device}, indent=2
+    ) + "\n"
 
 
 # --- Wi-Fi of this computer ------------------------------------------------------
@@ -347,17 +341,18 @@ def render_meta_data(hostname: str, instance_suffix: str) -> str:
 
 
 def card_files(
-    login: DeviceLogin, auth_key: str, ssid: str, wifi_password: str, ssh_keys: list[str], suffix: str, tag: str | None
+    enrolment: Enrolment, auth_key: str, ssid: str, wifi_password: str, ssh_keys: list[str], suffix: str,
+    tag: str | None,
 ) -> dict[str, str]:
     """Boot-partition path -> text."""
-    settings = {"hostname": login.hostname}
+    settings = {"hostname": enrolment.hostname}
     if tag:
         settings["tag"] = tag
     return {
-        "user-data": render_user_data(login.hostname, ssh_keys),
+        "user-data": render_user_data(enrolment.hostname, ssh_keys),
         "network-config": render_network_config(ssid, wifi_password),
-        "meta-data": render_meta_data(login.hostname, suffix),
-        f"{BOOT_DIR}/device.env": render_device_env(login),
+        "meta-data": render_meta_data(enrolment.hostname, suffix),
+        f"{BOOT_DIR}/enroll.json": render_enroll(enrolment),
         f"{BOOT_DIR}/tailscale-authkey": auth_key + "\n",
         f"{BOOT_DIR}/settings.json": json.dumps(settings, indent=2) + "\n",
     }
@@ -398,21 +393,21 @@ def ask_auth_key(prompt: Callable[[str], str] = getpass.getpass) -> str:
     return key
 
 
-def ask_login(
+def ask_enrolment(
     organization: str | None,
     device: str | None,
     ask: Callable[[str], str] = input,
     ask_secret: Callable[[str], str] = getpass.getpass,
-) -> DeviceLogin:
-    print("\nDevice login (from the Easysort admin who made the device).")
+) -> Enrolment:
+    print("\nDevice name and enrolment code (the code is from an Easysort admin).")
     organization = check_name(organization or ask("Organization (e.g. acme): "), "organization")
-    device = check_name(device or ask("Device name (e.g. yard-01): "), "device name")
+    device = check_name(device or ask("Name for this device (e.g. yard-01): "), "device name")
     if len(f"{organization}-{device}") > 63:
         raise FlashError("organization and device give a hostname over 63 characters")
-    password = ask_secret(f"Device password for {organization}/{device} (hidden): ").strip()
-    if not password:
-        raise FlashError("No device password given")
-    return DeviceLogin(organization, device, device_email(organization, device), password)
+    code = ask_secret("Enrolment code (hidden): ").strip()
+    if not code:
+        raise FlashError("No enrolment code given")
+    return Enrolment(organization, device, code)
 
 
 # --- Disk ------------------------------------------------------------------------
@@ -668,6 +663,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="an SSH public key line to let in as easysort (repeatable; Tailscale SSH works without one)",
     )
     parser.add_argument("--tag", help="Tailscale tag to advertise; only if the auth key is tagged")
+    parser.add_argument("--no-check", action="store_true",
+                        help="do not check the enrolment code with the Worker first (e.g. no internet here)")
     parser.add_argument("--dry-run", type=Path, metavar="DIR",
                         help="write the card files into DIR with placeholders; no disk, network or prompts")
     args = parser.parse_args(argv)
@@ -684,25 +681,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             organization = check_name(args.organization or "example", "organization")
             device = check_name(args.device or "site-01", "device name")
-            login = DeviceLogin(organization, device, device_email(organization, device), "device-password-placeholder")
+            enrolment = Enrolment(organization, device, "enrolment-code-placeholder")
             args.dry_run.mkdir(parents=True, exist_ok=True)
             write_card(args.dry_run, card_files(
-                login, "tskey-auth-DRYRUN", "example-wifi", "wifi-password-placeholder", ssh_keys, suffix, args.tag
+                enrolment, "tskey-auth-DRYRUN", "example-wifi", "wifi-password-placeholder", ssh_keys, suffix, args.tag
             ))
-            print(f"Wrote the card files for {login.hostname} to {args.dry_run}")
+            print(f"Wrote the card files for {enrolment.hostname} to {args.dry_run}")
             return 0
 
         ssids, lookup = linux_wifi() if LINUX else mac_wifi()
         ssid, wifi_password = choose_wifi(ssids, lookup)
         auth_key = ask_auth_key()
-        login = ask_login(args.organization, args.device)
-        print("Checking the device login with Supabase ...")
-        verify_login(login)
-        print(f"Login OK: the Pi will upload as {login.organization}/{login.device}.")
+        enrolment = ask_enrolment(args.organization, args.device)
+        if args.no_check:
+            print("Not checking the enrolment code (--no-check).")
+        else:
+            print("Checking the enrolment code with the Worker ...")
+            check_enrolment(enrolment)
+            print(f"Code OK and {enrolment.organization}/{enrolment.device} is free.")
         disk, summary, info = choose_card(args.disk)
         image = cached_image()
         print(
-            f"\nAbout to ERASE {summary}\nand write a motion-recording card for {login.hostname} "
+            f"\nAbout to ERASE {summary}\nand write a motion-recording card for {enrolment.hostname} "
             f"on Wi-Fi {ssid}."
         )
         if input(f"Type {disk} to continue: ").strip() != disk:
@@ -715,8 +715,8 @@ def main(argv: list[str] | None = None) -> int:
             write_image(disk, image)
             boot = mount_boot_partition(disk)
         try:
-            write_card(boot, card_files(login, auth_key, ssid, wifi_password, ssh_keys, suffix, args.tag))
-            del auth_key, wifi_password, login
+            write_card(boot, card_files(enrolment, auth_key, ssid, wifi_password, ssh_keys, suffix, args.tag))
+            del auth_key, wifi_password, enrolment
         finally:
             if LINUX:
                 linux_unmount(boot)

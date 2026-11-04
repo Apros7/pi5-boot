@@ -10,8 +10,8 @@ Full description, admin setup and troubleshooting:
 ## Make a card (on site)
 
 You need: a Mac or Linux computer on the site's Wi-Fi, a micro-SD card
-(8-256 GB), a Tailscale auth key and the device's organization, device name
-and password (from the Easysort admin who set up the device).
+(8-256 GB), a Tailscale auth key and the enrolment code (both from an
+Easysort admin). You choose the device's name.
 
 ```bash
 git clone https://github.com/Apros7/pi5-boot.git   # or: cd pi5-boot && git pull
@@ -20,7 +20,8 @@ python3 flash.py
 ```
 
 The script asks for the Wi-Fi (it suggests the one this computer uses), the
-Tailscale key, the device login and the card, then writes the card. Put the
+Tailscale key, the organization, a name for the device, the enrolment code
+and the card, then writes the card. The Pi enrols itself on first boot. Put the
 card in the Pi, plug in the camera(s), then power. The first start takes
 about 10 minutes; after that the Pi records whenever it has power.
 
@@ -29,7 +30,8 @@ about 10 minutes; after that the Pi records whenever it has power.
 | File | Runs on | What it does |
 |---|---|---|
 | `flash.py` | your computer | Writes Raspberry Pi OS Lite and the first-boot setup to the card. |
-| `firstboot.sh` | Pi, every boot | Moves the secrets off the boot partition, installs packages, joins Tailscale. |
+| `firstboot.sh` | Pi, every boot | Moves the secrets off the boot partition, installs packages, joins Tailscale, enrols. |
+| `enroll.py` | Pi, first boot | Enrols with the Worker and saves the device's upload token. |
 | `motion_capture.py` | Pi, as `easysort-motion.service` | Cameras, motion check, 15-minute windows. |
 | `windows.py` | Pi | Fuses each window's kept frames into one mp4 and a JSON sidecar. |
 | `upload.py` | Pi | Uploads queued windows to R2 through the device-storage Worker. |
