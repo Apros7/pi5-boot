@@ -43,7 +43,10 @@ Raspberry Pi OS Lite              apt: python3-opencv, ffmpeg
    without network catches up. A failed step does not stop the others, so
    the Pi still joins Tailscale when enrolment is stuck.
 4. `easysort-motion.service` runs `motion_capture.py` at every boot and
-   restarts it if it stops.
+   restarts it if it stops. On first boot it waits quietly until
+   `easysort-firstboot` has installed the packages and written
+   `/etc/easysort/packages-ready`. It does not wait for Tailscale or
+   enrolment: it records anyway, and windows queue until the token exists.
 
 ## Recording
 

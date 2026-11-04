@@ -11,6 +11,11 @@ Group=easysort
 SupplementaryGroups=video
 WorkingDirectory=/opt/easysort-motion
 Environment=PYTHONUNBUFFERED=1
+# On first boot easysort-firstboot is still installing python3-opencv and
+# ffmpeg; wait for it quietly instead of crashing. Tailscale and enrolment
+# are not waited for: windows queue until the device token exists.
+ExecStartPre=/bin/sh -c 'until [ -f /etc/easysort/packages-ready ]; do sleep 5; done'
+TimeoutStartSec=infinity
 ExecStart=/usr/bin/python3 /opt/easysort-motion/motion_capture.py --data /var/lib/easysort-motion --device-token /etc/easysort/device-token
 StateDirectory=easysort-motion
 Restart=always

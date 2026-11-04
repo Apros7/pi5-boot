@@ -6,14 +6,16 @@
 # runs it again in 30 s.
 #
 # 1. Moves the files flash.py left on the boot partition to /etc/easysort.
-# 2. Installs the packages the motion service needs.
+# 2. Installs the packages the motion service needs, then writes
+#    /etc/easysort/packages-ready, which easysort-motion waits for.
 # 3. Installs Tailscale and joins with the one-time auth key, then deletes it.
 # 4. Enrols with the Worker, saves the device token, deletes the enrolment code.
 set -u
 
-BOOT=/boot/firmware/easysort
-ETC=/etc/easysort
-APP=/opt/easysort-motion
+# Overridable only so the tests can run this script in a sandbox.
+BOOT=${EASYSORT_BOOT:-/boot/firmware/easysort}
+ETC=${EASYSORT_ETC:-/etc/easysort}
+APP=${EASYSORT_APP:-/opt/easysort-motion}
 PACKAGES="python3-opencv python3-numpy ffmpeg curl"
 failed=0
 
@@ -37,15 +39,24 @@ for package in $PACKAGES; do
 done
 if [ -n "$missing" ]; then
   echo "Installing$missing"
-  { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing; } || failed=1
+  if apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing; then
+    missing=""
+  else
+    failed=1
+  fi
+fi
+if [ -z "$missing" ]; then
+  # easysort-motion waits for this before it starts. Written before the
+  # Tailscale and enrolment steps, so recording never waits for them.
+  touch "$ETC/packages-ready"
 fi
 
 if [ -f "$ETC/tailscale-authkey" ]; then
   joined=0
   if command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh; then
     systemctl enable --now tailscaled
-    HOSTNAME=$(python3 -c 'import json; print(json.load(open("/etc/easysort/settings.json"))["hostname"])')
-    TAG=$(python3 -c 'import json; print(json.load(open("/etc/easysort/settings.json")).get("tag", ""))')
+    HOSTNAME=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["hostname"])' "$ETC/settings.json")
+    TAG=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("tag", ""))' "$ETC/settings.json")
     if [ -n "$TAG" ]; then
       tailscale up --auth-key="file:$ETC/tailscale-authkey" --hostname="$HOSTNAME" --ssh --advertise-tags="$TAG" && joined=1
     else
