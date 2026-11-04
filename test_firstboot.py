@@ -111,6 +111,7 @@ class MotionUnitTests(unittest.TestCase):
             "ExecStartPre=/bin/sh -c 'until [ -f /etc/easysort/packages-ready ]; do sleep 5; done'", unit
         )
         self.assertIn("TimeoutStartSec=infinity", unit)
+        self.assertIn("KillMode=mixed", unit)  # SIGTERM only the main process, not ffmpeg
         # Nothing may make recording depend on Tailscale, enrolment or firstboot succeeding.
         for line in unit.splitlines():
             if line.startswith(("Requires=", "BindsTo=", "Requisite=", "ExecStartPre=", "ConditionPathExists=")):

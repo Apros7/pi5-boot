@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -80,6 +81,17 @@ class WindowSinkTests(unittest.TestCase):
         self.assertEqual(sidecar["source"], {"model": "m"})
         self.assertFalse(sidecar["incomplete"])
         self.assertEqual(list((self.data / "work").iterdir()), [])
+
+    def test_stop_ends_ffmpeg_cleanly_in_its_own_session(self) -> None:
+        sink = WindowSink(self.data)
+        clip = Clip(T0, T0)
+        sink.frame(clip, T0, jpeg(1))
+        process = sink._window.part.process
+        # A signal to the service's process group does not reach ffmpeg.
+        self.assertNotEqual(os.getpgid(process.pid), os.getpgid(0))
+        with self.assertNoLogs("pi5-motion", "ERROR"):
+            sink.stop()
+        self.assertEqual(process.returncode, 0)
 
     def test_empty_window_writes_nothing(self) -> None:
         sink = WindowSink(self.data)

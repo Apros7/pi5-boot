@@ -20,7 +20,9 @@ ExecStart=/usr/bin/python3 /opt/easysort-motion/motion_capture.py --data /var/li
 StateDirectory=easysort-motion
 Restart=always
 RestartSec=10
-# Let the open ffmpeg part finish on stop.
+# On stop, SIGTERM only motion_capture.py; it closes ffmpeg's stdin so the
+# open part is finished cleanly. Anything left after the timeout is killed.
+KillMode=mixed
 TimeoutStopSec=120
 
 [Install]

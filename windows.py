@@ -199,8 +199,10 @@ class WindowSink:
     def _start_part(self, window: _Window) -> _Part:
         index = len(list(window.folder.glob("part-*.jsonl")))
         path = window.folder / f"part-{index:03d}.mp4"
-        # ffmpeg errors go to the service journal.
-        process = self.popen(part_command(path), stdin=subprocess.PIPE)
+        # ffmpeg errors go to the service journal. Its own session keeps a
+        # SIGTERM or Ctrl-C for the service away from it: on stop, the part
+        # is ended by closing stdin, so ffmpeg finishes the file cleanly.
+        process = self.popen(part_command(path), stdin=subprocess.PIPE, start_new_session=True)
         frames_file = (window.folder / f"part-{index:03d}.jsonl").open("a", encoding="utf-8")
         return _Part(index=index, process=process, frames_file=frames_file)
 
