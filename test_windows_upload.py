@@ -37,6 +37,75 @@ def jpeg(value: int) -> bytes:
     return cv2.imencode(".jpg", frame)[1].tobytes()
 
 
+class FrameLinesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "part-000.jsonl"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def lines(self, *frames: dict) -> bytes:
+        return b"".join(json.dumps(frame).encode() + b"\n" for frame in frames)
+
+    def test_good_file(self) -> None:
+        self.path.write_bytes(self.lines({"t": 1}, {"t": 2}) + b"\n")
+        self.assertEqual(windows.read_frame_lines(self.path), ([{"t": 1}, {"t": 2}], 0))
+
+    def test_nul_tail_after_power_cut(self) -> None:
+        # The SD card kept the new length but not the data: the end reads as NULs.
+        self.path.write_bytes(self.lines({"t": 1}, {"t": 2}) + b"\x00" * 2500)
+        self.assertEqual(windows.read_frame_lines(self.path), ([{"t": 1}, {"t": 2}], 0))
+        self.path.write_bytes(self.lines({"t": 1}) + b"\x00" * 400 + b"\n" + b"\x00" * 400)
+        self.assertEqual(windows.read_frame_lines(self.path), ([{"t": 1}], 0))
+
+    def test_half_line(self) -> None:
+        self.path.write_bytes(self.lines({"t": 1}) + b'{"t": 2, "mot')
+        self.assertEqual(windows.read_frame_lines(self.path), ([{"t": 1}], 1))
+
+    def test_stops_at_the_first_damaged_line(self) -> None:
+        self.path.write_bytes(self.lines({"t": 1}) + b"\x00\x00garbage\n" + b"[1]\n" + self.lines({"t": 3}))
+        self.assertEqual(windows.read_frame_lines(self.path), ([{"t": 1}], 3))
+        self.path.write_bytes(self.lines({"t": 1}) + b"\xff\xfe\n" + self.lines({"t": 3}))
+        self.assertEqual(windows.read_frame_lines(self.path), ([{"t": 1}], 2))
+        self.path.write_bytes(b"[1, 2]\n")
+        self.assertEqual(windows.read_frame_lines(self.path), ([], 1))
+
+
+class RecoverTests(unittest.TestCase):
+    """recover() without ffmpeg: a window that cannot be finished is set aside."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_failing_window_is_moved_aside_and_the_rest_still_finished(self) -> None:
+        sink = WindowSink(self.data)
+        work = self.data / "work"
+        for start in (T0, T0 + WINDOW_S):
+            (work / str(start)).mkdir(parents=True)
+        finished = []
+
+        def finalize(folder: Path) -> None:
+            if folder.name == str(T0):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+            finished.append(folder.name)
+
+        with mock.patch.object(sink, "finalize", side_effect=finalize), \
+                self.assertLogs("pi5-motion", "ERROR") as logs:
+            sink.recover(T0 + 3 * WINDOW_S)
+        self.assertEqual(finished, [str(T0 + WINDOW_S)])
+        self.assertIn("moving it aside", logs.output[0])
+        self.assertEqual(sorted(p.name for p in work.iterdir()), sorted([f"broken-{T0}", str(T0 + WINDOW_S)]))
+        # A broken- folder is never tried again.
+        with mock.patch.object(sink, "finalize", side_effect=AssertionError("retried")):
+            (work / str(T0 + WINDOW_S)).rmdir()
+            sink.recover(T0 + 4 * WINDOW_S)
+
+
 class WindowNameTests(unittest.TestCase):
     def test_names(self) -> None:
         self.assertEqual(window_start(T0 + 899.9), T0)
@@ -150,6 +219,23 @@ class WindowSinkTests(unittest.TestCase):
         sidecar = json.loads((self.data / "queue" / "2026-10-30" / "1200.json").read_text())
         self.assertEqual(sidecar["frame_count"], 4)
         self.assertTrue(sidecar["incomplete"])
+
+    def test_recover_after_power_cut_with_nul_tail(self) -> None:
+        sink = WindowSink(self.data)
+        for i in range(4):
+            sink.frame(Clip(0, 0), T0 + i, jpeg(i))
+        sink.stop()
+        jsonl = self.data / "work" / str(T0) / "part-000.jsonl"
+        # What a power cut left on the Pi: the file's length got saved, its data did not.
+        with jsonl.open("ab") as handle:
+            handle.write(b'{"t": 17938' + b"\x00" * 1500)
+        with self.assertLogs("pi5-motion", "WARNING") as logs:
+            WindowSink(self.data).recover(T0 + 901)
+        self.assertTrue(any("skipped 1 damaged line" in line for line in logs.output))
+        sidecar = json.loads((self.data / "queue" / "2026-10-30" / "1200.json").read_text())
+        self.assertEqual(sidecar["frame_count"], 4)
+        self.assertTrue(sidecar["incomplete"])
+        self.assertFalse((self.data / "work" / str(T0)).exists())
 
     def test_full_window_drops_the_rest(self) -> None:
         sink = WindowSink(self.data)

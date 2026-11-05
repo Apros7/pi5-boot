@@ -7,9 +7,11 @@ https://<hostname>.<tailnet>.ts.net/, so it is never on the LAN, Wi-Fi or 4G
 side. Without that: `ssh -L 8080:127.0.0.1:8080 easysort@<hostname>` and open
 http://127.0.0.1:8080/.
 
-Built for a 4G link: no auto refresh, no scripts, no video. Reload the page
-to look again. The page is a few KB and never cached; each image is about
-100 KB and cached by the browser (its name changes when it does).
+Built for a 4G link. On opening, the live view updates once a second for
+60 s and then stops (a button starts another 60 s); it polls /live.json
+(well under 1 KB) and loads each new live JPEG (about 30 KB), so one minute
+of watching is about 2 MB. Without JavaScript the page is static: reload to
+look again. Images are cached by the browser (the name changes with them).
 
 Read-only. It serves only the JPEGs motion_capture.py writes to
 /run/easysort-motion, and reads the upload queue's size; nothing secret is
@@ -36,6 +38,7 @@ DATA_DIR = Path("/var/lib/easysort-motion")
 MOTION_UNIT = "easysort-motion.service"
 IMAGE_RE = re.compile(r"^/img/((?:live|motion)-[0-9]+-[0-9]+\.jpg)$")
 LIVE_STALE_S = 30
+LIVE_WATCH_S = 60
 
 THROTTLE_BITS = {
     0: "under-voltage now",
@@ -178,6 +181,42 @@ def read_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def motion_text(last_motion: object, now: float) -> str:
+    if not isinstance(last_motion, (int, float)):
+        return "none since the service started"
+    return when(float(last_motion), now)
+
+
+def live_state(run_dir: Path = RUN_DIR, now: float | None = None) -> dict:
+    """What the live view's script polls: newest frame per camera and motion."""
+    now = time.time() if now is None else now
+    index = read_json(run_dir / "snapshots.json")
+    live = []
+    for entry in index.get("live", []):
+        name = str(entry.get("file", ""))
+        if not IMAGE_RE.match(f"/img/{name}"):
+            continue
+        ts = float(entry.get("ts", 0))
+        live.append({
+            "src": f"/img/{name}",
+            "camera": str(entry.get("camera", "")),
+            "ts": ts,
+            "age_s": round(now - ts, 1),
+            "motion": bool(entry.get("motion", False)),
+        })
+    last = index.get("last_motion")
+    return {
+        "now": now,
+        "live": live,
+        "last_motion": last if isinstance(last, (int, float)) else None,
+        "last_motion_text": motion_text(last, now),
+    }
+
+
+def badge(moved: bool) -> str:
+    return '<span class="badge on">MOTION</span>' if moved else '<span class="badge">no motion</span>'
+
+
 def figure(entry: dict, now: float, note: str = "") -> str:
     name = str(entry.get("file", ""))
     if not IMAGE_RE.match(f"/img/{name}"):
@@ -213,6 +252,7 @@ def render_page(
         uptime = "unknown"
     rows = [
         ("Recording service", service_state(run=run)),
+        ("Last motion", f'<span id="last-motion">{motion_text(index.get("last_motion"), now)}</span>'),
         ("Last upload", last_upload),
         ("Upload queue", queue_size(data_dir / "queue")),
         ("CPU temperature", cpu_temperature(temp_file)),
@@ -225,7 +265,15 @@ def render_page(
     live = []
     for entry in index.get("live", []):
         stale = now - float(entry.get("ts", 0)) > LIVE_STALE_S
-        live.append(figure(entry, now, " <b>(old: is the recording service running?)</b>" if stale else ""))
+        note = " <b>(old: is the recording service running?)</b>" if stale else ""
+        shown = figure(entry, now, note)
+        if not shown:
+            continue
+        # Numbered like live_state()'s list, which skips the same entries.
+        live.append(
+            f'<div class="cam" data-cam="{len(live)}"><div class="state">{badge(bool(entry.get("motion")))}</div>'
+            f'{shown}</div>'
+        )
     motion = [figure(entry, now) for entry in reversed(index.get("motion", []))]
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -236,16 +284,72 @@ body{{font:14px/1.4 system-ui,sans-serif;margin:16px;max-width:960px}}
 img{{width:100%;height:auto;display:block;background:#ccc}}
 figure{{margin:0 0 16px}} figcaption{{color:#555}}
 th{{text-align:left;padding:2px 12px 2px 0;vertical-align:top;white-space:nowrap}}
+td{{overflow-wrap:anywhere}}
+.cam{{position:relative}} .state{{position:absolute;top:8px;left:8px;z-index:1}}
+.badge{{display:inline-block;padding:4px 10px;border-radius:4px;font-weight:600;background:#333c;color:#fff}}
+.badge.on{{background:#d00;animation:blink 1s step-start infinite}}
+@keyframes blink{{50%{{opacity:.6}}}}
+#watch{{margin:0 0 8px}} #watch button{{font:inherit;padding:6px 12px}}
 </style></head><body>
 <h1>{html.escape(host)}</h1>
-<p>As of {when(now, now).rsplit(" (", 1)[0]}. No auto refresh: <a href="/">reload</a> to look again.</p>
+<p>As of {when(now, now).rsplit(" (", 1)[0]}. <a href="/">Reload</a> to update the table.</p>
 <table>{table}</table>
 <h2>Live</h2>
-{"".join(live) or "<p>No frame yet (the recording service writes one every 5 s).</p>"}
+<p id="watch"><span id="watch-text">Static image (JavaScript off).</span> <button id="watch-btn" hidden>Watch live for {LIVE_WATCH_S} s</button></p>
+{"".join(live) or "<p>No frame yet (the recording service writes one every second).</p>"}
 <h2>Last motion</h2>
 {"".join(motion) or "<p>No motion seen since the service started.</p>"}
+<script>{LIVE_SCRIPT}</script>
 </body></html>
 """
+
+
+LIVE_SCRIPT = """
+(function () {
+  var WATCH = %d, text = document.getElementById("watch-text"), btn = document.getElementById("watch-btn");
+  var until = 0, timer = null, busy = false;
+  function cam(n) { return document.querySelector('.cam[data-cam="' + n + '"]'); }
+  function show(state) {
+    document.getElementById("last-motion").textContent = state.last_motion_text;
+    state.live.forEach(function (e, n) {
+      var c = cam(n); if (!c) return;
+      var img = c.querySelector("img"), cap = c.querySelector("figcaption"), st = c.querySelector(".state");
+      if (!img || !cap || !st) return;
+      if (img.getAttribute("src") !== e.src) {
+        var next = new Image();
+        next.onload = function () { img.src = e.src; };
+        next.src = e.src;
+      }
+      var t = new Date(e.ts * 1000).toLocaleTimeString();
+      cap.textContent = e.camera + ": " + t + " (" + Math.max(0, Math.round(e.age_s)) + " s old)" +
+        (e.age_s > %d ? " - old: is the recording service running?" : "");
+      st.innerHTML = e.motion ? '<span class="badge on">MOTION</span>' : '<span class="badge">no motion</span>';
+    });
+  }
+  function tick() {
+    var left = Math.ceil((until - Date.now()) / 1000);
+    if (left <= 0) { stop(); return; }
+    text.textContent = "Live, updating every second: " + left + " s left.";
+    if (busy) return;
+    busy = true;
+    fetch("/live.json", {cache: "no-store"}).then(function (r) { return r.json(); })
+      .then(show).catch(function () { text.textContent = "Live view: no answer from the device, trying again."; })
+      .then(function () { busy = false; });
+  }
+  function stop() {
+    clearInterval(timer); timer = null;
+    text.textContent = "Live view paused to save mobile data.";
+    btn.hidden = false;
+  }
+  function start() {
+    until = Date.now() + WATCH * 1000; btn.hidden = true;
+    if (!timer) timer = setInterval(tick, 1000);
+    tick();
+  }
+  btn.addEventListener("click", start);
+  start();
+})();
+""" % (LIVE_WATCH_S, LIVE_STALE_S)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -263,6 +367,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_text(500, f"error: {error}")
                 return
             self.send(200, "text/html; charset=utf-8", body, "no-store")
+            return
+        if path == "/live.json":
+            try:
+                body = json.dumps(live_state(self.run_dir)).encode()
+            except Exception as error:
+                self.send_text(500, f"error: {error}")
+                return
+            self.send(200, "application/json", body, "no-store")
             return
         match = IMAGE_RE.match(path)
         if match:

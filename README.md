@@ -26,7 +26,8 @@ card in the Pi, plug in the camera(s), then power. The first start takes
 about 10 minutes; after that the Pi records whenever it has power.
 
 To check the cameras, open `https://<org>-<device>.<tailnet>.ts.net/` from a
-device on the tailnet. No auto refresh, to save 4G data: reload to look again.
+device on the tailnet. The live image updates every second for 60 s after
+opening, then pauses to save 4G data (a button starts another minute).
 
 ## Files
 

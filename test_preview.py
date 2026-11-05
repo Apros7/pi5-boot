@@ -51,18 +51,38 @@ class SnapshotTests(unittest.TestCase):
     def index(self) -> dict:
         return json.loads((self.dir / "snapshots.json").read_text())
 
-    def test_live_every_5_s_motion_every_10_s_newest_5(self) -> None:
+    def test_live_every_1_s_motion_every_10_s_newest_5(self) -> None:
         snaps = Snapshots(self.dir, ["cam-a", "cam-b"])
         for step in range(240):  # 60 s at 4 fps, motion on camera b all the time
             snaps.update(NOW + step * 0.25, [frame(10), frame(200)], [False, True])
         index = self.index()
         self.assertEqual([e["camera"] for e in index["live"]], ["cam-a", "cam-b"])
-        self.assertEqual(index["live"][0]["ts"], NOW + 55)
+        self.assertEqual(index["live"][0]["ts"], NOW + 59)
         self.assertEqual([e["ts"] for e in index["motion"]], [NOW + 10 * i for i in range(1, 6)])
         self.assertTrue(all(e["camera"] == "cam-b" for e in index["motion"]))
         files = sorted(p.name for p in self.dir.glob("*.jpg"))
-        self.assertEqual(len(files), 2 * 2 + 5)  # newest and previous live per camera, 5 motion
+        self.assertEqual(len(files), 2 * 5 + 5)  # newest 5 live per camera, 5 motion
         self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name.startswith(".")), [])
+
+    def test_live_frames_say_whether_their_camera_moved(self) -> None:
+        snaps = Snapshots(self.dir, ["cam-a", "cam-b"])
+        self.assertIsNone(snaps.last_motion)
+        snaps.update(NOW, [frame(1), frame(2)], [False, False])
+        index = self.index()
+        self.assertEqual([e["motion"] for e in index["live"]], [False, False])
+        self.assertIsNone(index["last_motion"])
+        # Motion on camera b between two live frames is carried to the next one.
+        snaps.update(NOW + 0.25, [frame(1), frame(2)], [False, True])
+        snaps.update(NOW + 0.5, [frame(1), frame(2)], [False, False])
+        snaps.update(NOW + 1, [frame(1), frame(2)], [False, False])
+        index = self.index()
+        self.assertEqual([e["motion"] for e in index["live"]], [False, True])
+        self.assertEqual(index["last_motion"], NOW + 0.25)
+        # ...and only to that one.
+        snaps.update(NOW + 2, [frame(1), frame(2)], [False, False])
+        index = self.index()
+        self.assertEqual([e["motion"] for e in index["live"]], [False, False])
+        self.assertEqual(index["last_motion"], NOW + 0.25)
 
     def test_images_are_small(self) -> None:
         snaps = Snapshots(self.dir, ["cam"])
@@ -153,10 +173,46 @@ class PageTests(unittest.TestCase):
             self.assertIn(text, page)
         self.assertEqual(page.count("<img "), 2)  # live and one motion
         self.assertNotIn("&amp;", page)
-        self.assertNotIn("<script", page)
-        self.assertNotIn("refresh", page.lower().replace("no auto refresh", ""))
-        self.assertLess(len(page), 8000)
+        self.assertIn('<span id="last-motion">', page)
+        self.assertIn('<div class="cam" data-cam="0">', page)
+        self.assertIn('<span class="badge on">MOTION</span>', page)
+        self.assertIn("var WATCH = 60", page)
+        self.assertEqual(page.count("<script>"), 1)  # inline only, nothing loaded from elsewhere
+        self.assertNotIn('http-equiv="refresh"', page)
+        self.assertLess(len(page), 12000)
         self.assertNotIn(str(self.run_dir), page)
+
+    def test_no_motion_yet(self) -> None:
+        (self.run_dir / "snapshots.json").write_text(json.dumps({
+            "live": [{"file": "live-0-1.jpg", "camera": "cam", "ts": NOW - 1}], "motion": []}))
+        page = self.page()
+        self.assertIn("none since the service started", page)
+        self.assertIn('<span class="badge">no motion</span>', page)
+
+    def test_live_state(self) -> None:
+        state = preview.live_state(self.run_dir, NOW)
+        self.assertEqual(state["now"], NOW)
+        self.assertEqual(len(state["live"]), 1)
+        entry = state["live"][0]
+        self.assertTrue(entry["src"].startswith("/img/live-0-"))
+        self.assertEqual((entry["camera"], entry["ts"], entry["age_s"], entry["motion"]),
+                         ("046d_C920<x>", NOW - 3, 3.0, True))
+        self.assertEqual(state["last_motion"], NOW - 3)
+        self.assertIn("(3 s ago)", state["last_motion_text"])
+        self.assertLess(len(json.dumps(state)), 1000)
+
+    def test_live_state_skips_bad_entries_and_survives_no_index(self) -> None:
+        (self.run_dir / "snapshots.json").write_text(json.dumps({
+            "live": [{"file": "../secret.jpg", "ts": NOW}, {"file": "live-1-5.jpg", "camera": "b", "ts": NOW}],
+            "last_motion": "soon"}))
+        state = preview.live_state(self.run_dir, NOW)
+        self.assertEqual([e["src"] for e in state["live"]], ["/img/live-1-5.jpg"])
+        self.assertIsNone(state["last_motion"])
+        self.assertEqual(state["last_motion_text"], "none since the service started")
+        # The page numbers its cameras the same way, so the script finds them.
+        self.assertIn('<div class="cam" data-cam="0">', self.page())
+        (self.run_dir / "snapshots.json").unlink()
+        self.assertEqual(preview.live_state(self.run_dir, NOW)["live"], [])
 
     def test_old_live_frame_is_flagged(self) -> None:
         self.assertIn("is the recording service running", self.page(NOW + 120))
@@ -179,6 +235,11 @@ class PageTests(unittest.TestCase):
             self.assertEqual(reply.headers["Cache-Control"], "no-store")
             page = reply.read().decode()
         image = page.split('src="', 1)[1].split('"', 1)[0]
+        with urllib.request.urlopen(base + "/live.json") as reply:
+            self.assertEqual(reply.headers["Content-Type"], "application/json")
+            self.assertEqual(reply.headers["Cache-Control"], "no-store")
+            state = json.loads(reply.read())
+        self.assertEqual(state["live"][0]["src"], image)
         with urllib.request.urlopen(base + image) as reply:
             self.assertEqual(reply.headers["Content-Type"], "image/jpeg")
             self.assertIn("immutable", reply.headers["Cache-Control"])

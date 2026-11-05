@@ -73,6 +73,28 @@ def join_command(list_file: Path, out: Path) -> list[str]:
     ]
 
 
+def read_frame_lines(path: Path) -> tuple[list[dict], int]:
+    """A part's frame lines and how many lines could not be read.
+
+    Stops at the first damaged line: after a power cut only the end of the
+    file is bad, and the frames after a bad line cannot be matched to the
+    mp4's frames any more.
+    """
+    lines: list[dict] = []
+    raw = path.read_bytes().split(b"\n")
+    for number, line in enumerate(raw):
+        if not line.strip(b" \t\r\x00"):
+            continue
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return lines, sum(1 for rest in raw[number:] if rest.strip(b" \t\r\x00"))
+        if not isinstance(value, dict):
+            return lines, sum(1 for rest in raw[number:] if rest.strip(b" \t\r\x00"))
+        lines.append(value)
+    return lines, 0
+
+
 def count_frames(path: Path, run: Callable = subprocess.run) -> int:
     """Frames ffmpeg can read back from a part; 0 if it is unreadable."""
     result = run(
@@ -178,7 +200,16 @@ class WindowSink:
                 continue
             start = int(folder.name)
             if start != current and now >= start + WINDOW_S:
-                self.finalize(folder)
+                try:
+                    self.finalize(folder)
+                except Exception:
+                    # Never let one damaged window stop recording for good:
+                    # set it aside (a non-numeric name is skipped) and go on.
+                    log.exception("Could not finish window %s; moving it aside", folder.name)
+                    try:
+                        folder.replace(folder.with_name(f"broken-{folder.name}"))
+                    except OSError:
+                        log.exception("Could not move %s aside", folder)
 
     def stop(self) -> None:
         """Close the current part without ending the window (service stop)."""
@@ -233,7 +264,11 @@ class WindowSink:
         incomplete = False
         for jsonl in sorted(folder.glob("part-*.jsonl")):
             mp4 = jsonl.with_suffix(".mp4")
-            lines = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            lines, damaged = read_frame_lines(jsonl)
+            if damaged:
+                # A power cut can leave NUL bytes or half a line at the end.
+                log.warning("%s: skipped %d damaged line(s)", jsonl, damaged)
+                incomplete = True
             readable = count_frames(mp4, self.run) if mp4.exists() else 0
             if readable < len(lines):
                 # Power was cut while this part was written.

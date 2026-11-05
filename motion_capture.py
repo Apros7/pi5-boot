@@ -295,7 +295,8 @@ def camera_name(device: str) -> str:
 class Snapshots:
     """Small JPEGs of what the cameras see, for preview.py.
 
-    Each camera's newest frame every live_every_s, and the frames of the
+    Each camera's newest frame every live_every_s (with whether that camera
+    saw motion since the one before), and the frames of the
     cameras that saw motion, at most once every motion_every_s, keeping the
     newest `keep`. Images are at most 960 px wide at JPEG quality 70 (about
     100 KB). The folder is /run (RAM), so this costs no SD-card writes. Any
@@ -308,7 +309,7 @@ class Snapshots:
         self,
         folder: Path,
         cameras: list[str],
-        live_every_s: float = 5.0,
+        live_every_s: float = 1.0,
         motion_every_s: float = 10.0,
         keep: int = 5,
     ) -> None:
@@ -319,6 +320,8 @@ class Snapshots:
         self.keep = keep
         self.live: dict[int, list[dict]] = {}
         self.motion: list[dict] = []
+        self.last_motion: float | None = None
+        self._moved_since_live: dict[int, bool] = {}
         self._next_live = float("-inf")
         self._next_motion = float("-inf")
         self._warned = False
@@ -354,16 +357,22 @@ class Snapshots:
 
     def _update(self, ts: float, frames: list[np.ndarray | None], motion: list[bool]) -> None:
         changed = False
+        for number, moved in enumerate(motion):
+            if moved:
+                self._moved_since_live[number] = True
+                self.last_motion = ts
         if ts >= self._next_live:
             self._next_live = ts + self.live_every_s
             for number, frame in enumerate(frames):
                 if frame is None:
                     continue
                 entries = self.live.setdefault(number, [])
-                entries.append(self._write("live", number, ts, frame))
-                # The one before stays a little longer, for a page that
-                # was made just before this write.
-                while len(entries) > 2:
+                entry = self._write("live", number, ts, frame)
+                entry["motion"] = self._moved_since_live.pop(number, False)
+                entries.append(entry)
+                # A few older ones stay a little longer, for a page on a
+                # slow 4G link that read the index just before this write.
+                while len(entries) > 5:
                     self._remove(entries.pop(0))
                 changed = True
         if any(motion) and ts >= self._next_motion:
@@ -380,6 +389,7 @@ class Snapshots:
             index = {
                 "live": [entries[-1] for _, entries in sorted(self.live.items())],
                 "motion": self.motion,
+                "last_motion": self.last_motion,
             }
             write_atomic(self.folder / self.INDEX, json.dumps(index).encode())
 

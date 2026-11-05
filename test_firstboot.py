@@ -34,7 +34,8 @@ if [ $dir = 1 ]; then mkdir -p "$@"; else cp "$1" "$2"; fi
     "dpkg-query": '#!/bin/sh\n[ "$PACKAGES_INSTALLED" = 1 ] && printf "install ok installed"\n',
     "apt-get": '#!/bin/sh\necho "apt-get $*" >> "$LOG"\nexit "$APT_RC"\n',
     "shred": '#!/bin/sh\nfor last; do :; done\nrm -f "$last"\n',
-    "systemctl": "#!/bin/sh\nexit 0\n",
+    "systemctl": '#!/bin/sh\necho "systemctl $*" >> "$LOG"\nexit 0\n',
+    "journalctl": '#!/bin/sh\necho "journalctl $*" >> "$LOG"\nexit 0\n',
     "tailscale": '#!/bin/sh\necho "tailscale $*" >> "$LOG"\nexit "$TAILSCALE_RC"\n',
     "timeout": '#!/bin/sh\nshift\nexec "$@"\n',
 }
@@ -58,6 +59,7 @@ class FirstbootTests(unittest.TestCase):
         (self.app / "enroll.py").write_text(FAILING_ENROLL)
         self.log = root / "log"
         self.log.touch()
+        self.journald = root / "journald.conf.d" / "easysort.conf"
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -69,6 +71,7 @@ class FirstbootTests(unittest.TestCase):
             "EASYSORT_BOOT": str(self.boot),
             "EASYSORT_ETC": str(self.etc),
             "EASYSORT_APP": str(self.app),
+            "EASYSORT_JOURNALD_CONF": str(self.journald),
             "PACKAGES_INSTALLED": "1" if packages_installed else "0",
             "APT_RC": str(apt_rc),
             "TAILSCALE_RC": str(tailscale_rc),
@@ -114,6 +117,17 @@ class FirstbootTests(unittest.TestCase):
         )
         self.assertEqual(self.run_firstboot(packages_installed=True, tailscale_rc=0), 0)
         self.assertIn("tailscale serve", self.log.read_text())
+
+
+    def test_journal_is_kept_on_disk_once(self) -> None:
+        self.run_firstboot(packages_installed=True)
+        self.assertEqual(self.journald.read_text(), "[Journal]\nStorage=persistent\nSystemMaxUse=200M\n")
+        log = self.log.read_text()
+        self.assertIn("systemctl restart systemd-journald", log)
+        self.assertIn("journalctl --flush", log)
+        self.log.write_text("")
+        self.run_firstboot(packages_installed=True)
+        self.assertNotIn("systemd-journald", self.log.read_text())  # already set: no restart every boot
 
 
 class MotionUnitTests(unittest.TestCase):

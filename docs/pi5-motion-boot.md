@@ -151,6 +151,8 @@ tailscale ssh easysort@<org>-<device>
 systemctl status easysort-firstboot easysort-motion easysort-preview
 journalctl -u easysort-firstboot -b      # "Enrolled as <org>/<device>", "Joined Tailscale as ..."
 journalctl -u easysort-motion -f         # every 5 min: frames, motion, kept, clips
+journalctl -u easysort-motion -b -1      # the boot before (the journal is kept on disk, max 200 MB)
+ls /var/lib/easysort-motion/work          # open windows; broken-<start> = set aside, see below
 ls /var/lib/easysort-motion/queue         # windows waiting to upload
 ```
 
@@ -160,16 +162,20 @@ Uploaded windows are in R2 under `reuse-detection/<org>/<device>/`.
 
 Open `https://<org>-<device>.<tailnet>.ts.net/` from a device on the tailnet
 (the tailnet name is in the Tailscale admin console under DNS). It shows each
-camera's newest frame (taken every 5 s) and the last 5 motion frames, with
-local and UTC time and the camera's name, plus the recording service's state
-and uptime, the last upload result, the queue size, CPU temperature,
+camera's newest frame (taken every second) with a MOTION / no motion badge,
+the time motion was last seen, and the last 5 motion frames, with local and
+UTC time and the camera's name, plus the recording service's state and
+uptime, the last upload result, the queue size, CPU temperature,
 `vcgencmd get_throttled` in words and the network interface in use (`eth1`
 is the 4G dongle).
 
-It is built for 4G data: no auto refresh, no scripts, no video; reload to
-look again. The page is a few KB and never cached. Images are at most 960 px
-wide at JPEG quality 70 (about 100 KB) and cached by the browser, so a reload
-only fetches the new ones.
+It is built for 4G data. When the page opens, a small inline script polls
+`/live.json` (well under 1 KB) once a second for 60 s and swaps in each new
+live image, then pauses; "Watch live for 60 s" starts another minute. One
+minute of watching is about 2 MB. Without JavaScript the page is static:
+reload to look again. The page is a few KB and never cached. Images are at
+most 960 px wide at JPEG quality 70 (about 30 KB for a typical scene) and
+cached by the browser, since each has its own name.
 
 - `motion_capture.py` writes the images to `/run/easysort-motion` (RAM, no
   SD-card writes). Errors there are logged once and never stop recording.
@@ -183,6 +189,16 @@ only fetches the new ones.
   ACL that lets you reach the device on port 443. If serve is not set up:
   `tailscale ssh -L 8080:127.0.0.1:8080 easysort@<org>-<device>` (or plain
   `ssh -L`), then open `http://127.0.0.1:8080/`.
+
+### After a power cut
+
+A power cut can leave the end of an open window's `part-*.jsonl` files as NUL
+bytes or half a line (the SD card saved the new length, not the data). On the
+next start the recorder reads each file up to the first damaged line, logs
+`skipped N damaged line(s)`, and queues the window marked `incomplete`. If a
+window still cannot be finished, it is logged with a traceback and renamed
+`work/broken-<start>` so recording carries on; check the journal for the
+reason and delete the folder once it has been looked at.
 
 ## Where secrets are
 

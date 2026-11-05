@@ -5,7 +5,9 @@
 # the Pi can be reached). If any step failed the script exits 1 and systemd
 # runs it again in 30 s.
 #
-# 1. Moves the files flash.py left on the boot partition to /etc/easysort.
+# 1. Moves the files flash.py left on the boot partition to /etc/easysort,
+#    and keeps the journal on disk (capped at 200 MB), so the logs from
+#    before a power cut or crash can still be read after the reboot.
 # 2. Installs the packages the motion service needs, then writes
 #    /etc/easysort/packages-ready, which easysort-motion waits for.
 # 3. Installs Tailscale and joins with the one-time auth key, then deletes it.
@@ -19,6 +21,7 @@ set -u
 BOOT=${EASYSORT_BOOT:-/boot/firmware/easysort}
 ETC=${EASYSORT_ETC:-/etc/easysort}
 APP=${EASYSORT_APP:-/opt/easysort-motion}
+JOURNALD_CONF=${EASYSORT_JOURNALD_CONF:-/etc/systemd/journald.conf.d/easysort.conf}
 PACKAGES="python3-opencv python3-numpy ffmpeg curl"
 failed=0
 
@@ -34,6 +37,20 @@ move_secret enroll.json "$ETC/enroll.json" 0600 root:root || failed=1
 move_secret tailscale-authkey "$ETC/tailscale-authkey" 0600 root:root || failed=1
 if [ -f "$BOOT/settings.json" ]; then
   install -m 0644 "$BOOT/settings.json" "$ETC/settings.json" || failed=1
+fi
+
+journald_conf() {
+  printf '%s\n' '[Journal]' 'Storage=persistent' 'SystemMaxUse=200M'
+}
+if [ "$(cat "$JOURNALD_CONF" 2>/dev/null)" != "$(journald_conf)" ]; then
+  # journald makes /var/log/journal itself once Storage=persistent.
+  if mkdir -p "$(dirname "$JOURNALD_CONF")" && journald_conf > "$JOURNALD_CONF" &&
+    systemctl restart systemd-journald; then
+    journalctl --flush || true
+    echo "Journal kept on disk (at most 200 MB)"
+  else
+    failed=1
+  fi
 fi
 
 missing=""
